@@ -1,0 +1,90 @@
+name: xmpp-platform
+label: XMPP
+kind: platform
+version: 0.1.0
+description: >
+  XMPP gateway adapter for Hermes Agent. Supports direct chats first and
+  conservative MUC room routing second.
+author: Emma Apollo
+requires_env:
+  - name: XMPP_JID
+    description: "XMPP account JID, for example bot@example.org"
+    prompt: "XMPP JID"
+    password: false
+  - name: XMPP_SERVER
+    description: "XMPP server hostname"
+    prompt: "XMPP server"
+    password: false
+optional_env:
+  - name: XMPP_PASSWORD
+    description: "XMPP account password; prefer XMPP_PASSWORD_FILE or XMPP_PASSWORD_COMMAND"
+    prompt: "XMPP password"
+    password: true
+  - name: XMPP_PASSWORD_FILE
+    description: "Path to a file containing the XMPP password"
+    prompt: "Password file"
+    password: false
+  - name: XMPP_PASSWORD_COMMAND
+    description: "Command that prints the XMPP password"
+    prompt: "Password command"
+    password: false
+  - name: XMPP_PORT
+    description: "Optional XMPP TCP port; default 5222 unless the server URL includes a port"
+    prompt: "XMPP port"
+    password: false
+  - name: XMPP_RESOURCE
+    description: "XMPP resource name, default hermes"
+    prompt: "XMPP resource"
+    password: false
+  - name: XMPP_NICKNAME
+    description: "Nickname for MUC rooms"
+    prompt: "MUC nickname"
+    password: false
+  - name: XMPP_ROOMS
+    description: "Comma-separated MUC room JIDs to join"
+    prompt: "MUC rooms"
+    password: false
+  - name: XMPP_ALLOWED_USERS
+    description: "Comma-separated bare JIDs/patterns allowed to use direct chat; supports exact JID, *@domain, and *"
+    prompt: "Allowed direct-chat JIDs"
+    password: false
+  - name: XMPP_DM_POLICY
+    description: "Direct-message policy: allowlist, open, disabled, or pairing"
+    prompt: "DM policy"
+    password: false
+  - name: XMPP_ALLOW_ALL_USERS
+    description: "Allow all direct-chat users; development/trusted use only"
+    prompt: "Allow all users?"
+    password: false
+  - name: XMPP_GROUP_POLICY
+    description: "MUC/group policy: allowlist, open, or disabled"
+    prompt: "Group policy"
+    password: false
+  - name: XMPP_ALLOWED_ROOMS
+    description: "Comma-separated MUC room JIDs allowed when group policy is allowlist"
+    prompt: "Allowed MUC rooms"
+    password: false
+  - name: XMPP_GROUP_ALLOW_FROM
+    description: "Comma-separated bare JIDs/patterns allowed inside MUCs"
+    prompt: "Allowed MUC sender JIDs"
+    password: false
+  - name: XMPP_MUC_REQUIRE_MENTION
+    description: "Require bot nickname mention in MUCs, default true"
+    prompt: "Require MUC mention?"
+    password: false
+  - name: XMPP_HOME_CHAT
+    description: "Default chat or room JID for cron/notification delivery"
+    prompt: "Home chat"
+    password: false
+  - name: XMPP_SEND_DELIVERY_RECEIPTS
+    description: "Send XEP-0184 delivery receipts to authorized direct messages that request them; default true"
+    prompt: "Send delivery receipts?"
+    password: false
+  - name: XMPP_SEND_RECEIVED_MARKERS
+    description: "Send XEP-0333 received markers to authorized direct messages marked as markable; default true"
+    prompt: "Send received chat markers?"
+    password: false
+  - name: XMPP_SEND_READ_RECEIPTS
+    description: "Send XEP-0333 displayed/read markers; default false for privacy"
+    prompt: "Send displayed/read markers?"
+    password: false
