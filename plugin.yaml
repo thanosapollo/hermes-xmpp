@@ -32,6 +32,10 @@ optional_env:
     description: "Optional XMPP TCP port; default 5222 unless the server URL includes a port"
     prompt: "XMPP port"
     password: false
+  - name: XMPP_HOST
+    description: "Compatibility alias for XMPP_SERVER"
+    prompt: "XMPP host alias"
+    password: false
   - name: XMPP_RESOURCE
     description: "XMPP resource name, default hermes"
     prompt: "XMPP resource"
@@ -40,9 +44,17 @@ optional_env:
     description: "Nickname for MUC rooms"
     prompt: "MUC nickname"
     password: false
+  - name: XMPP_MUC_NICK
+    description: "Compatibility alias for XMPP_NICKNAME"
+    prompt: "MUC nickname alias"
+    password: false
   - name: XMPP_ROOMS
     description: "Comma-separated MUC room JIDs to join"
     prompt: "MUC rooms"
+    password: false
+  - name: XMPP_MUC_ROOMS
+    description: "Compatibility alias for XMPP_ROOMS"
+    prompt: "MUC rooms alias"
     password: false
   - name: XMPP_ALLOWED_USERS
     description: "Comma-separated bare JIDs/patterns allowed to use direct chat; supports exact JID, *@domain, and *"
@@ -76,6 +88,18 @@ optional_env:
     description: "Default chat or room JID for cron/notification delivery"
     prompt: "Home chat"
     password: false
+  - name: XMPP_HOME_CHANNEL
+    description: "Compatibility alias for XMPP_HOME_CHAT"
+    prompt: "Home channel alias"
+    password: false
+  - name: XMPP_TEXT_CHUNK_LIMIT
+    description: "Split outbound text above this many characters before sending"
+    prompt: "Text chunk limit"
+    password: false
+  - name: XMPP_MAX_MESSAGE_LENGTH
+    description: "Compatibility alias for XMPP_TEXT_CHUNK_LIMIT"
+    prompt: "Max message length alias"
+    password: false
   - name: XMPP_SEND_DELIVERY_RECEIPTS
     description: "Send XEP-0184 delivery receipts to authorized direct messages that request them; default true"
     prompt: "Send delivery receipts?"
@@ -87,4 +111,28 @@ optional_env:
   - name: XMPP_SEND_READ_RECEIPTS
     description: "Send XEP-0333 displayed/read markers; default false for privacy"
     prompt: "Send displayed/read markers?"
+    password: false
+  - name: XMPP_SEND_CHAT_STATES
+    description: "Send XEP-0085 composing/active chat-state notifications while processing; default true"
+    prompt: "Send chat-state typing indicators?"
+    password: false
+  - name: XMPP_REACTIONS
+    description: "Send XEP-0444 processing reactions to authorized messages; default true"
+    prompt: "Send processing reactions?"
+    password: false
+  - name: XMPP_REACTION_START_CHOICES
+    description: "Comma-separated XEP-0444 reaction choices for processing start; default 👀"
+    prompt: "Processing start reaction choices"
+    password: false
+  - name: XMPP_REACTION_SUCCESS_CHOICES
+    description: "Comma-separated XEP-0444 reaction choices for successful completion; default ✅"
+    prompt: "Success reaction choices"
+    password: false
+  - name: XMPP_REACTION_FAILURE_CHOICES
+    description: "Comma-separated XEP-0444 reaction choices for failed completion; default ❌"
+    prompt: "Failure reaction choices"
+    password: false
+  - name: XMPP_PROGRESS_DELIVERY
+    description: "Progress/status delivery: messages (default visible messages) or edit (XEP-0308 corrections)"
+    prompt: "Progress delivery mode"
     password: false

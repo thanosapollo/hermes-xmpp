@@ -27,14 +27,14 @@ This repository keeps the adapter in `hermes_xmpp/adapter.py`. For local Hermes 
 Environment variables:
 
 - `XMPP_JID`: account JID, for example `bot@example.org`.
-- `XMPP_SERVER`: XMPP server hostname, `host:port`, or URL such as `xmpp://chat.example.org:5222`.
+- `XMPP_SERVER`: XMPP server hostname, `host:port`, or URL such as `xmpp://chat.example.org:5222`. Alias: `XMPP_HOST`.
 - `XMPP_PORT`: optional TCP port override.
 - `XMPP_PASSWORD`: account password. Prefer `XMPP_PASSWORD_FILE` or `XMPP_PASSWORD_COMMAND`.
 - `XMPP_PASSWORD_FILE`: file containing the password.
 - `XMPP_PASSWORD_COMMAND`: command that prints the password to stdout, for example `pass show xmpp/bot@example.org`.
 - `XMPP_RESOURCE`: resource name, default `hermes`.
-- `XMPP_NICKNAME`: MUC nickname, default localpart from `XMPP_JID`.
-- `XMPP_ROOMS`: comma-separated MUC JIDs to join.
+- `XMPP_NICKNAME`: MUC nickname, default localpart from `XMPP_JID`. Alias: `XMPP_MUC_NICK`.
+- `XMPP_ROOMS`: comma-separated MUC JIDs to join. Alias: `XMPP_MUC_ROOMS`.
 - `XMPP_ALLOWED_USERS`: comma-separated bare JIDs or patterns allowed to use direct chat. Supports exact JIDs, `*@domain`, and `*`.
 - `XMPP_DM_POLICY`: `allowlist` (default), `open`, `disabled`, or `pairing` (treated as allowlist unless Hermes pairing is configured separately).
 - `XMPP_ALLOW_ALL_USERS`: allow all direct-chat senders. Use only for trusted/dev environments.
@@ -42,12 +42,20 @@ Environment variables:
 - `XMPP_ALLOWED_ROOMS`: comma-separated MUC room JIDs allowed when group policy is `allowlist`.
 - `XMPP_GROUP_ALLOW_FROM`: comma-separated bare JIDs or patterns allowed inside MUCs.
 - `XMPP_MUC_REQUIRE_MENTION`: default `true`.
-- `XMPP_HOME_CHAT`: default destination for cron/notification delivery.
+- `XMPP_HOME_CHAT`: default destination for cron/notification delivery. Alias: `XMPP_HOME_CHANNEL`.
+- `XMPP_TEXT_CHUNK_LIMIT`: split outbound text above this many characters before sending. Alias: `XMPP_MAX_MESSAGE_LENGTH`.
 - `XMPP_SEND_DELIVERY_RECEIPTS`: send XEP-0184 `<received xmlns='urn:xmpp:receipts'/>` replies to authorized direct-chat messages that request them. Default `true`.
 - `XMPP_SEND_RECEIVED_MARKERS`: send XEP-0333 `<received xmlns='urn:xmpp:chat-markers:0'/>` markers to authorized direct-chat messages marked `<markable/>`. Default `true`.
 - `XMPP_SEND_READ_RECEIPTS`: send XEP-0333 `<displayed/>` read/display markers to authorized direct-chat messages marked `<markable/>`. Default `false` for privacy.
+- `XMPP_REACTIONS`: send XEP-0444 processing reactions to authorized messages. Default `true`; direct messages are allowed after DM authorization, and MUC reactions stay behind the same room/sender/mention gates as message processing.
+- `XMPP_REACTION_START_CHOICES`: comma-separated reaction choices for processing start; one is chosen randomly. Default `👀`.
+- `XMPP_REACTION_SUCCESS_CHOICES`: comma-separated reaction choices for successful completion; one is chosen randomly. Default `✅`.
+- `XMPP_REACTION_FAILURE_CHOICES`: comma-separated reaction choices for failed completion; one is chosen randomly. Default `❌`.
+- `XMPP_EDITABLE_PROGRESS`: controls XEP-0308 editable status/progress when editable delivery is enabled. `known` (default) edits only after a positive recipient support probe, `force` allows edits for known-compatible deployments, and `disabled` avoids correction stanzas.
+- `XMPP_PROGRESS_DELIVERY`: `messages` (default) sends progress/status as normal visible XMPP messages for broad client compatibility. `edit` opts into XEP-0308 editable bubbles governed by `XMPP_EDITABLE_PROGRESS`.
+- Tool progress: Hermes-visible progress/status lines (for example lifecycle notices, `🔎 search_files`, `📖 read_file`, `💻 terminal`) use the gateway's progress/status path. By default the adapter chooses plain visible XMPP messages because clients such as Emacs/Jabber may not render XEP-0308 corrections. Set `XMPP_PROGRESS_DELIVERY=edit` only for clients known to render Last Message Correction; if an edit fails, status routing falls back to a fresh visible message like Telegram. Disable progress at the Hermes level with `display.platforms.xmpp.tool_progress: off`.
 
-Receipt/marker behavior is conservative: replies are only sent after allowlist authorization, marker/receipt stanzas do not get marker replies, and groupchat marker/receipt sending is disabled for now because XEP-0333 requires extra care around MUC stanza IDs (XEP-0359).
+Receipt/marker behavior is conservative: replies are only sent after allowlist authorization, marker/receipt stanzas do not get marker replies, and groupchat marker/receipt sending is disabled for now because XEP-0333 requires extra care around MUC stanza IDs (XEP-0359). Processing reactions are likewise conservative: unauthorized senders get no reaction, processing start/success/failure choose from configurable reaction sets, and XEP-0444 failures are soft/no-op. Code that already has a Hermes `MessageEvent` can call the adapter's `react_to_event(event, reactions)` helper to send arbitrary reactions such as `❤️` or `😂`; the helper reuses the original event target and authorization gates rather than accepting raw public message ids. Tool-progress delivery uses the same Hermes gateway routing/metadata as ordinary sends, and can be switched from visible messages to editable XEP-0308 bubbles when the receiving client supports corrections. The live slixmpp client also requests STARTTLS and requires TLS before authentication.
 
 Equivalent YAML values should live under `gateway.platforms.xmpp.extra` when Hermes loads the plugin:
 
@@ -66,6 +74,9 @@ gateway:
         allowed_users:
           - user@example.org
         muc_require_mention: true
+        reaction_success_choices:
+          - ✅
+          - ❤️
 ```
 
 ## Rollback

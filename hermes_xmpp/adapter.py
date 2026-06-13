@@ -6,8 +6,10 @@ Hermes-native adapter code; OpenClaw is only a behavior reference.
 from __future__ import annotations
 
 import logging
+import inspect
 import mimetypes
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -27,7 +29,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 
 try:
     from gateway.config import Platform
-    from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+    from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
     try:
         from gateway.platforms.base import MediaKind  # type: ignore[import-not-found]
     except Exception:  # pragma: no cover - older Hermes without MEDIA_KINDS
@@ -47,6 +49,11 @@ except Exception:  # pragma: no cover - static/unit-test fallback outside Hermes
 
     class MessageType:  # type: ignore[no-redef]
         TEXT = "text"
+
+    class ProcessingOutcome(str, Enum):  # type: ignore[no-redef]
+        SUCCESS = "success"
+        FAILURE = "failure"
+        CANCELLED = "cancelled"
 
     class MessageEvent:  # type: ignore[no-redef]
         def __init__(self, **kwargs: Any):
@@ -74,6 +81,9 @@ except Exception:  # pragma: no cover - static/unit-test fallback outside Hermes
         async def handle_message(self, event: Any) -> None:
             self._handled_events.append(event)
 
+        async def edit_message(self, chat_id: str, message_id: str, content: str, **_: Any) -> SendResult:
+            return SendResult(success=False, error="message editing is not supported")
+
 
 def _split_csv(value: Any) -> list[str]:
     if value is None:
@@ -81,6 +91,11 @@ def _split_csv(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _reaction_choices(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    choices = tuple(_split_csv(value))
+    return choices or default
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -180,6 +195,63 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _first_config_value(extra: dict[str, Any], *keys: str, default: Any = "") -> Any:
+    for key in keys:
+        value = extra.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _first_env_or_config(
+    extra: dict[str, Any],
+    env_names: tuple[str, ...],
+    config_keys: tuple[str, ...],
+    default: Any = "",
+) -> Any:
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value not in (None, ""):
+            return value
+    return _first_config_value(extra, *config_keys, default=default)
+
+
+def _env_string(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item) for item in value)
+    return str(value)
+
+
+def split_text_for_xmpp(text: str, limit: int) -> list[str]:
+    """Split oversized outbound text without dropping content.
+
+    Prefer newline/space boundaries so XMPP clients see readable chunks, but
+    hard-split a single oversized token when necessary. Empty input still sends
+    one empty chunk so Hermes' normal text-send path preserves its behavior.
+    """
+    text = str(text or "")
+    if limit <= 0 or len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = max(
+            remaining.rfind("\n", 0, limit + 1),
+            remaining.rfind(" ", 0, limit + 1),
+        )
+        if split_at <= 0:
+            split_at = limit
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:limit]
+            split_at = limit
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip(" \n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 @dataclass
 class XmppSettings:
     jid: str
@@ -202,14 +274,35 @@ class XmppSettings:
     send_received_markers: bool = True
     send_read_receipts: bool = False
     send_chat_states: bool = True
+    reactions_enabled: bool = True
+    reaction_start_choices: tuple[str, ...] = ("👀",)
+    reaction_success_choices: tuple[str, ...] = ("✅",)
+    reaction_failure_choices: tuple[str, ...] = ("❌",)
     text_chunk_limit: int = 4000
+    tool_progress_bubble_limit: int = 30
+    editable_progress_policy: str = "known"
+    progress_delivery: str = "messages"
 
     @classmethod
     def from_config(cls, config: Any) -> "XmppSettings":
         extra = getattr(config, "extra", {}) or {}
-        jid = os.getenv("XMPP_JID") or str(extra.get("jid", ""))
-        nickname = os.getenv("XMPP_NICKNAME") or str(extra.get("nickname") or _localpart(jid))
-        room_values = _split_csv(os.getenv("XMPP_ROOMS") or extra.get("rooms", []))
+        jid = str(_first_env_or_config(extra, ("XMPP_JID",), ("jid",)))
+        nickname = str(
+            _first_env_or_config(
+                extra,
+                ("XMPP_NICKNAME", "XMPP_MUC_NICK"),
+                ("nickname", "muc_nick"),
+                _localpart(jid),
+            )
+        )
+        room_values = _split_csv(
+            _first_env_or_config(
+                extra,
+                ("XMPP_ROOMS", "XMPP_MUC_ROOMS"),
+                ("rooms", "muc_rooms"),
+                [],
+            )
+        )
         room_values.extend(_split_csv(os.getenv("XMPP_GROUPS") or extra.get("groups", [])))
         allowed_users = {
             _bare_jid(user)
@@ -221,34 +314,131 @@ class XmppSettings:
         }
         group_allow_from = {
             _bare_jid(user)
-            for user in _split_csv(os.getenv("XMPP_GROUP_ALLOW_FROM") or extra.get("group_allow_from", []))
+            for user in _split_csv(
+                os.getenv("XMPP_GROUP_ALLOW_FROM") or extra.get("group_allow_from", [])
+            )
         }
         allowed_rooms = {
             _bare_jid(room)
-            for room in _split_csv(os.getenv("XMPP_ALLOWED_ROOMS") or extra.get("allowed_rooms", room_values))
+            for room in _split_csv(
+                os.getenv("XMPP_ALLOWED_ROOMS") or extra.get("allowed_rooms", room_values)
+            )
         }
         return cls(
             jid=jid,
-            server=os.getenv("XMPP_SERVER") or str(extra.get("server", "")),
+            server=str(
+                _first_env_or_config(extra, ("XMPP_SERVER", "XMPP_HOST"), ("server", "host"))
+            ),
             port=_int_or_none(os.getenv("XMPP_PORT") or extra.get("port")),
             password=_resolve_password(extra),
-            resource=os.getenv("XMPP_RESOURCE") or str(extra.get("resource", "hermes")),
+            resource=str(
+                _first_env_or_config(extra, ("XMPP_RESOURCE",), ("resource",), "hermes")
+            ),
             nickname=nickname,
             rooms=[_bare_jid(room) for room in room_values],
             allowed_users=allowed_users,
             group_allow_from=group_allow_from,
-            allow_all_users=_truthy(os.getenv("XMPP_ALLOW_ALL_USERS"), _truthy(extra.get("allow_all_users"))),
-            muc_require_mention=_truthy(os.getenv("XMPP_MUC_REQUIRE_MENTION"), _truthy(extra.get("muc_require_mention"), True)),
-            home_chat=os.getenv("XMPP_HOME_CHAT") or str(extra.get("home_chat", "")),
-            dm_policy=_normalize_policy(os.getenv("XMPP_DM_POLICY") or extra.get("dm_policy"), "allowlist", {"allowlist", "open", "disabled", "pairing"}),
-            group_policy=_normalize_policy(os.getenv("XMPP_GROUP_POLICY") or extra.get("group_policy"), "allowlist", {"allowlist", "open", "disabled"}),
+            allow_all_users=_truthy(
+                os.getenv("XMPP_ALLOW_ALL_USERS"),
+                _truthy(extra.get("allow_all_users")),
+            ),
+            muc_require_mention=_truthy(
+                os.getenv("XMPP_MUC_REQUIRE_MENTION"),
+                _truthy(extra.get("muc_require_mention"), True),
+            ),
+            home_chat=str(
+                _first_env_or_config(
+                    extra,
+                    ("XMPP_HOME_CHAT", "XMPP_HOME_CHANNEL"),
+                    ("home_chat", "home_channel"),
+                )
+            ),
+            dm_policy=_normalize_policy(
+                os.getenv("XMPP_DM_POLICY") or extra.get("dm_policy"),
+                "allowlist",
+                {"allowlist", "open", "disabled", "pairing"},
+            ),
+            group_policy=_normalize_policy(
+                os.getenv("XMPP_GROUP_POLICY") or extra.get("group_policy"),
+                "allowlist",
+                {"allowlist", "open", "disabled"},
+            ),
             allowed_rooms=allowed_rooms,
-            anonymous_muc_policy=_normalize_policy(os.getenv("XMPP_ANONYMOUS_MUC_POLICY") or extra.get("anonymous_muc_policy"), "mention_only", {"deny", "allow", "mention_only"}),
-            send_delivery_receipts=_truthy(os.getenv("XMPP_SEND_DELIVERY_RECEIPTS"), _truthy(extra.get("send_delivery_receipts"), True)),
-            send_received_markers=_truthy(os.getenv("XMPP_SEND_RECEIVED_MARKERS"), _truthy(extra.get("send_received_markers"), True)),
-            send_read_receipts=_truthy(os.getenv("XMPP_SEND_READ_RECEIPTS"), _truthy(extra.get("send_read_receipts"), False)),
-            send_chat_states=_truthy(os.getenv("XMPP_SEND_CHAT_STATES"), _truthy(extra.get("send_chat_states"), True)),
-            text_chunk_limit=_int_or_none(os.getenv("XMPP_TEXT_CHUNK_LIMIT") or extra.get("text_chunk_limit")) or 4000,
+            anonymous_muc_policy=_normalize_policy(
+                os.getenv("XMPP_ANONYMOUS_MUC_POLICY") or extra.get("anonymous_muc_policy"),
+                "mention_only",
+                {"deny", "allow", "mention_only"},
+            ),
+            send_delivery_receipts=_truthy(
+                os.getenv("XMPP_SEND_DELIVERY_RECEIPTS"),
+                _truthy(extra.get("send_delivery_receipts"), True),
+            ),
+            send_received_markers=_truthy(
+                os.getenv("XMPP_SEND_RECEIVED_MARKERS"),
+                _truthy(extra.get("send_received_markers"), True),
+            ),
+            send_read_receipts=_truthy(
+                os.getenv("XMPP_SEND_READ_RECEIPTS"),
+                _truthy(extra.get("send_read_receipts"), False),
+            ),
+            send_chat_states=_truthy(
+                os.getenv("XMPP_SEND_CHAT_STATES"),
+                _truthy(extra.get("send_chat_states"), True),
+            ),
+            reactions_enabled=_truthy(
+                os.getenv("XMPP_REACTIONS"),
+                _truthy(extra.get("reactions_enabled", extra.get("reactions")), True),
+            ),
+            reaction_start_choices=_reaction_choices(
+                _first_env_or_config(
+                    extra,
+                    ("XMPP_REACTION_START_CHOICES",),
+                    ("reaction_start_choices", "reaction_start"),
+                ),
+                ("👀",),
+            ),
+            reaction_success_choices=_reaction_choices(
+                _first_env_or_config(
+                    extra,
+                    ("XMPP_REACTION_SUCCESS_CHOICES",),
+                    ("reaction_success_choices", "reaction_success"),
+                ),
+                ("✅",),
+            ),
+            reaction_failure_choices=_reaction_choices(
+                _first_env_or_config(
+                    extra,
+                    ("XMPP_REACTION_FAILURE_CHOICES",),
+                    ("reaction_failure_choices", "reaction_failure"),
+                ),
+                ("❌",),
+            ),
+            text_chunk_limit=_int_or_none(
+                _first_env_or_config(
+                    extra,
+                    ("XMPP_TEXT_CHUNK_LIMIT", "XMPP_MAX_MESSAGE_LENGTH"),
+                    ("text_chunk_limit", "max_message_length"),
+                )
+            )
+            or 4000,
+            tool_progress_bubble_limit=_int_or_none(
+                _first_env_or_config(
+                    extra,
+                    ("XMPP_TOOL_PROGRESS_BUBBLE_LIMIT",),
+                    ("tool_progress_bubble_limit",),
+                )
+            )
+            or 30,
+            editable_progress_policy=_normalize_policy(
+                os.getenv("XMPP_EDITABLE_PROGRESS") or extra.get("editable_progress_policy", extra.get("editable_progress")),
+                "known",
+                {"known", "force", "disabled"},
+            ),
+            progress_delivery=_normalize_policy(
+                os.getenv("XMPP_PROGRESS_DELIVERY") or extra.get("progress_delivery"),
+                "messages",
+                {"messages", "edit"},
+            ),
         )
 
     def connect_address(self) -> tuple[str, int] | None:
@@ -290,6 +480,13 @@ class XmppReceiptAction:
     to_jid: str
     message_id: str
     message_type: str = "chat"
+
+
+@dataclass(frozen=True)
+class XmppReactionTarget:
+    to_jid: str
+    message_id: str
+    message_type: str
 
 
 def _stanza_bool(msg: Any, key: str, namespace: str, name: str) -> bool:
@@ -510,15 +707,18 @@ def is_connected(config: Any) -> bool:
 
 
 def _env_enablement() -> Optional[dict[str, Any]]:
-    if not (os.getenv("XMPP_JID") and os.getenv("XMPP_SERVER")):
+    server = os.getenv("XMPP_SERVER") or os.getenv("XMPP_HOST")
+    if not (os.getenv("XMPP_JID") and server):
         return None
     extra = {
         "jid": os.getenv("XMPP_JID"),
-        "server": os.getenv("XMPP_SERVER"),
+        "server": server,
         "port": _int_or_none(os.getenv("XMPP_PORT")),
         "resource": os.getenv("XMPP_RESOURCE") or "hermes",
-        "nickname": os.getenv("XMPP_NICKNAME") or _localpart(os.getenv("XMPP_JID", "")),
-        "rooms": _split_csv(os.getenv("XMPP_ROOMS")),
+        "nickname": os.getenv("XMPP_NICKNAME")
+        or os.getenv("XMPP_MUC_NICK")
+        or _localpart(os.getenv("XMPP_JID", "")),
+        "rooms": _split_csv(os.getenv("XMPP_ROOMS") or os.getenv("XMPP_MUC_ROOMS")),
         "allowed_users": _split_csv(os.getenv("XMPP_ALLOWED_USERS")),
         "group_allow_from": _split_csv(os.getenv("XMPP_GROUP_ALLOW_FROM")),
         "allowed_rooms": _split_csv(os.getenv("XMPP_ALLOWED_ROOMS")),
@@ -526,17 +726,34 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         "dm_policy": os.getenv("XMPP_DM_POLICY") or "allowlist",
         "group_policy": os.getenv("XMPP_GROUP_POLICY") or "allowlist",
         "muc_require_mention": _truthy(os.getenv("XMPP_MUC_REQUIRE_MENTION"), True),
-        "home_chat": os.getenv("XMPP_HOME_CHAT") or os.getenv("XMPP_JID"),
+        "home_chat": os.getenv("XMPP_HOME_CHAT")
+        or os.getenv("XMPP_HOME_CHANNEL")
+        or os.getenv("XMPP_JID"),
         "send_delivery_receipts": _truthy(os.getenv("XMPP_SEND_DELIVERY_RECEIPTS"), True),
         "send_received_markers": _truthy(os.getenv("XMPP_SEND_RECEIVED_MARKERS"), True),
         "send_read_receipts": _truthy(os.getenv("XMPP_SEND_READ_RECEIPTS"), False),
         "send_chat_states": _truthy(os.getenv("XMPP_SEND_CHAT_STATES"), True),
+        "reactions_enabled": _truthy(os.getenv("XMPP_REACTIONS"), True),
+        "reaction_start_choices": _split_csv(os.getenv("XMPP_REACTION_START_CHOICES")),
+        "reaction_success_choices": _split_csv(os.getenv("XMPP_REACTION_SUCCESS_CHOICES")),
+        "reaction_failure_choices": _split_csv(os.getenv("XMPP_REACTION_FAILURE_CHOICES")),
+        "text_chunk_limit": _int_or_none(
+            os.getenv("XMPP_TEXT_CHUNK_LIMIT") or os.getenv("XMPP_MAX_MESSAGE_LENGTH")
+        )
+        or 4000,
+        "progress_delivery": os.getenv("XMPP_PROGRESS_DELIVERY") or "messages",
     }
-    return {"extra": extra, "home_channel": {"chat_id": extra["home_chat"], "name": "XMPP Home"}}
+    return {
+        "extra": extra,
+        "home_channel": {"chat_id": extra["home_chat"], "name": "XMPP Home"},
+    }
 
 
 def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> Optional[dict[str, Any]]:
-    extra = dict((platform_cfg or {}).get("extra") or {})
+    # Hermes convention is gateway.platforms.xmpp.extra. Also accept a small
+    # top-level xmpp: block for compatibility with older/community examples.
+    extra = dict((yaml_cfg or {}).get("xmpp") or {})
+    extra.update(dict((platform_cfg or {}).get("extra") or {}))
     for key, env_name in {
         "jid": "XMPP_JID",
         "server": "XMPP_SERVER",
@@ -552,9 +769,23 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> Optional[dict[str,
         "send_received_markers": "XMPP_SEND_RECEIVED_MARKERS",
         "send_read_receipts": "XMPP_SEND_READ_RECEIPTS",
         "send_chat_states": "XMPP_SEND_CHAT_STATES",
+        "reactions_enabled": "XMPP_REACTIONS",
+        "text_chunk_limit": "XMPP_TEXT_CHUNK_LIMIT",
+        "editable_progress_policy": "XMPP_EDITABLE_PROGRESS",
+        "editable_progress": "XMPP_EDITABLE_PROGRESS",
+        "progress_delivery": "XMPP_PROGRESS_DELIVERY",
     }.items():
         if extra.get(key) and not os.getenv(env_name):
-            os.environ[env_name] = str(extra[key])
+            os.environ[env_name] = _env_string(extra[key])
+    for key, env_name in {
+        "host": "XMPP_HOST",
+        "muc_rooms": "XMPP_MUC_ROOMS",
+        "muc_nick": "XMPP_MUC_NICK",
+        "home_channel": "XMPP_HOME_CHANNEL",
+        "max_message_length": "XMPP_MAX_MESSAGE_LENGTH",
+    }.items():
+        if extra.get(key) and not os.getenv(env_name):
+            os.environ[env_name] = _env_string(extra[key])
     return extra
 
 
@@ -569,8 +800,10 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
 
         self.adapter = adapter
         self.client = Client(adapter.settings.jid, adapter.settings.password)
+        setattr(self.client, "use_starttls", True)
+        setattr(self.client, "force_starttls", True)
         self.client.boundjid.resource = adapter.settings.resource
-        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0128", "xep_0184", "xep_0199", "xep_0333", "xep_0359", "xep_0363", "xep_0444"):
+        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0128", "xep_0184", "xep_0199", "xep_0308", "xep_0333", "xep_0334", "xep_0359", "xep_0363", "xep_0444"):
             try:
                 self.client.register_plugin(plugin)
             except Exception:
@@ -608,6 +841,67 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         msg.send()
         return message_id
 
+    async def edit_message(self, to_jid: str, message_id: str, text: str, message_type: str) -> str:
+        try:
+            correction_plugin = self.client.plugin["xep_0308"]
+        except Exception as exc:
+            raise RuntimeError("XMPP message correction (XEP-0308) is not supported") from exc
+        replacement_id = f"hermes-{uuid.uuid4().hex}"
+        msg = self.client.make_message(mto=to_jid, mbody=text, mtype=message_type)
+        msg["id"] = replacement_id
+        if self.adapter.settings.send_chat_states and message_type == "chat":
+            msg["chat_state"] = "active"
+        set_correction = getattr(correction_plugin, "set_correction", None)
+        if callable(set_correction):
+            set_correction(msg, message_id)
+        else:
+            msg["replace"]["id"] = message_id
+        msg.send()
+        return replacement_id
+
+    async def supports_message_correction(self, to_jid: str, message_type: str) -> bool:
+        """Best-effort XEP-0308 recipient support probe, fail-closed.
+
+        Local plugin registration is not enough: without a positive disco
+        feature for the target, an edit stanza may be ignored by the user's
+        client while Hermes thinks progress was updated.  Groupchat correction
+        support is especially client/MUC-dependent, so require explicit force
+        policy for groups for now.
+        """
+        try:
+            self.client.plugin["xep_0308"]
+        except Exception:
+            return False
+        if message_type != "chat":
+            return False
+        try:
+            disco = self.client.plugin["xep_0030"]
+        except Exception:
+            return False
+        get_info = getattr(disco, "get_info", None)
+        if not callable(get_info):
+            return False
+        try:
+            info: Any = get_info(jid=to_jid)
+            if inspect.isawaitable(info):
+                info = await info
+        except Exception:
+            return False
+        features = set()
+        try:
+            features.update(str(feature) for feature in info["disco_info"]["features"])
+        except Exception:
+            pass
+        try:
+            features.update(str(feature) for feature in info.get_features())
+        except Exception:
+            pass
+        try:
+            features.update(str(feature) for feature in info.get("features", []))
+        except Exception:
+            pass
+        return "urn:xmpp:message-correct:0" in features
+
     async def upload_file(self, file_path: str, content_type: str | None = None) -> str:
         uploader = None
         if hasattr(self.client, "plugin"):
@@ -642,6 +936,26 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         msg = self.client.make_message(mto=to_jid, mtype=message_type)
         msg[marker]["id"] = marker_id
         msg.send()
+
+    async def send_reactions(
+        self,
+        to_jid: str,
+        message_id: str,
+        reactions: tuple[str, ...] | list[str],
+        message_type: str = "chat",
+    ) -> bool:
+        try:
+            reactions_plugin = self.client.plugin["xep_0444"]
+        except Exception:
+            return False
+        msg = self.client.make_message(mto=to_jid, mtype=message_type)
+        reactions_plugin.set_reactions(msg, message_id, reactions)
+        try:
+            msg.enable("store")
+        except Exception:
+            pass
+        msg.send()
+        return True
 
     async def _on_session_start(self, _event: Any) -> None:
         self.client.send_presence()
@@ -720,6 +1034,10 @@ class XMPPAdapter(BasePlatformAdapter):
         self.settings = XmppSettings.from_config(config)
         self._client: Optional[_SlixmppClient] = None
         self._last_full_jid_by_chat: dict[str, str] = {}
+        self._sent_text_by_message_id: dict[str, str] = {}
+        self._tool_progress_bubbles_sent = 0
+        self._status_message_ids: dict[tuple[str, str], str] = {}
+        self._disabled_status_keys: set[tuple[str, str]] = set()
 
     @property
     def name(self) -> str:
@@ -765,8 +1083,152 @@ class XMPPAdapter(BasePlatformAdapter):
         target = _normalize_target(chat_id)
         message_type = "groupchat" if (metadata or {}).get("chat_type") == "group" or _is_group_jid(target) else "chat"
         try:
-            message_id = await self._client.send_message(target, content, message_type, thread_id=reply_to)
+            message_ids: list[str] = []
+            for index, chunk in enumerate(split_text_for_xmpp(content, self.settings.text_chunk_limit)):
+                message_id = await self._client.send_message(
+                    target,
+                    chunk,
+                    message_type,
+                    thread_id=reply_to if index == 0 else None,
+                )
+                message_ids.append(message_id)
+                self._sent_text_by_message_id[message_id] = chunk
+            return SendResult(
+                success=True,
+                message_id=message_ids[-1] if message_ids else None,
+                continuation_message_ids=tuple(message_ids[:-1]),
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    def _message_text_changed(self, message_id: str, content: str) -> bool:
+        previous = self._sent_text_by_message_id.get(message_id, "")
+        return str(previous or "") != str(content or "")
+
+    async def _supports_message_correction(self, target: str, message_type: str) -> bool:
+        """Return True only when editable progress is explicitly safe.
+
+        XEP-0308 being registered locally only proves that this bot can send a
+        correction stanza; it does not prove the recipient's client will render
+        it.  Default XMPP progress delivery is therefore plain visible messages,
+        matching Hermes' gateway fallback behavior across clients.  Operators
+        can opt into editable XEP-0308 bubbles with ``XMPP_PROGRESS_DELIVERY=edit``;
+        then ``XMPP_EDITABLE_PROGRESS`` controls whether support is probed,
+        forced, or disabled.
+        """
+        if self.settings.progress_delivery != "edit":
+            return False
+        policy = self.settings.editable_progress_policy
+        if policy == "disabled":
+            return False
+        if policy == "force":
+            return True
+        if not self._client:
+            return False
+        checker = getattr(self._client, "supports_message_correction", None)
+        if not callable(checker):
+            return False
+        try:
+            supported = checker(target, message_type)
+            if inspect.isawaitable(supported):
+                supported = await supported
+            return bool(supported)
+        except Exception:
+            logger.debug("XMPP: message correction support check failed for %s", target, exc_info=True)
+            return False
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send visible status updates or edit one status bubble.
+
+        Hermes gateway calls this from ``status_callback`` for lifecycle and
+        context-pressure notices.  XMPP clients vary widely in XEP-0308 rendering,
+        so the default ``progress_delivery=messages`` path sends each status as a
+        normal visible message.  When explicitly opted into editable delivery,
+        this mirrors Telegram's status routing: first send creates a bubble,
+        later calls edit it, and permanent edit failures fall back to a fresh
+        visible send instead of disappearing.
+        """
+        if self.settings.progress_delivery != "edit":
+            return await self.send(chat_id, content, metadata=metadata)
+        key = (str(chat_id), str(status_key))
+        if key in self._disabled_status_keys:
+            return SendResult(
+                success=False,
+                error="XMPP editable status is disabled for this chat/status key",
+                retryable=False,
+            )
+        cached_id = self._status_message_ids.get(key)
+        if cached_id:
+            result = await self.edit_message(chat_id, cached_id, content, metadata=metadata)
+            if result.success:
+                if result.message_id:
+                    self._status_message_ids[key] = str(result.message_id)
+                return result
+            if not result.retryable:
+                # Mirror Telegram's status fallback: if a correction cannot be
+                # applied, clear the stale id and send a fresh visible status
+                # instead of silently dropping future status callbacks.
+                self._status_message_ids.pop(key, None)
+                fresh = await self.send(chat_id, content, metadata=metadata)
+                if fresh.success and fresh.message_id:
+                    self._status_message_ids[key] = str(fresh.message_id)
+                return fresh
+            return result
+        result = await self.send(chat_id, content, metadata=metadata)
+        if result.success and result.message_id:
+            self._status_message_ids[key] = str(result.message_id)
+        return result
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        metadata: Optional[dict[str, Any]] = None,
+        **_: Any,
+    ) -> SendResult:
+        """Opt XMPP into Hermes tool progress with XEP-0308 edits.
+
+        Hermes' gateway treats an ``edit_message`` override as progress support.
+        When the connected client supports XEP-0308 Last Message Correction,
+        update the existing progress/status bubble by sending a correction
+        stanza.  If correction support is unavailable, fail without sending
+        extra fallback messages here; the gateway can decide whether to degrade
+        to per-line progress, and this adapter avoids doubling/spamming updates.
+        """
+        if not self._client:
+            return SendResult(success=False, error="XMPP adapter is not connected", retryable=True)
+        if not self._message_text_changed(message_id, content):
             return SendResult(success=True, message_id=message_id)
+        target, message_type = self._message_type_for_target(chat_id, metadata)
+        if not await self._supports_message_correction(target, message_type):
+            return SendResult(
+                success=False,
+                message_id=message_id,
+                error="XMPP message editing is not supported for this recipient/client",
+                retryable=False,
+            )
+        edit = getattr(self._client, "edit_message", None)
+        if edit is None:
+            return SendResult(
+                success=False,
+                message_id=message_id,
+                error="XMPP message editing is not supported",
+                retryable=False,
+            )
+        try:
+            await edit(target, message_id, str(content or ""), message_type)
+            self._sent_text_by_message_id[message_id] = str(content or "")
+            return SendResult(success=True, message_id=message_id)
+        except RuntimeError as exc:
+            return SendResult(success=False, message_id=message_id, error=str(exc), retryable=False)
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
 
@@ -882,6 +1344,95 @@ class XMPPAdapter(BasePlatformAdapter):
             return
         to_jid, message_type = target
         await self._client.send_chat_state(to_jid, "active", message_type)
+
+    def _reaction_target_for_event(self, event: MessageEvent) -> XmppReactionTarget | None:
+        if not self.settings.reactions_enabled:
+            return None
+        raw_message = getattr(event, "raw_message", None)
+        if raw_message is not None:
+            parsed = parse_xmpp_message(raw_message, self.settings)
+            if parsed is None or not authorized_xmpp_message(parsed, self.settings):
+                return None
+            if not parsed.message_id:
+                return None
+            if parsed.chat_type == "group":
+                return XmppReactionTarget(parsed.chat_id, parsed.message_id, "groupchat")
+            return XmppReactionTarget(parsed.receipt_target, parsed.message_id, "chat")
+
+        source = getattr(event, "source", None)
+        message_id = str(getattr(event, "message_id", "") or getattr(source, "message_id", "") or "")
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not message_id or not chat_id:
+            return None
+        chat_type = str(getattr(source, "chat_type", "") or "dm")
+        if chat_type == "group":
+            return None
+        user_id = str(getattr(source, "user_id", "") or chat_id)
+        if not _authorized_direct_message(self.settings, user_id):
+            return None
+        target = self._last_full_jid_by_chat.get(_bare_jid(chat_id), _normalize_target(chat_id))
+        return XmppReactionTarget(target, message_id, "chat")
+
+    async def _send_reactions_to_target(self, target: XmppReactionTarget, reactions: Any) -> bool:
+        if not self._client:
+            return False
+        normalized = tuple(_split_csv(reactions))
+        if not normalized:
+            return False
+        try:
+            return bool(
+                await self._client.send_reactions(
+                    target.to_jid,
+                    target.message_id,
+                    normalized,
+                    target.message_type,
+                )
+            )
+        except Exception:
+            logger.debug("XMPP: failed sending reaction for %s", target.message_id, exc_info=True)
+            return False
+
+    async def react_to_event(self, event: MessageEvent, reactions: Any) -> bool:
+        """Send arbitrary XEP-0444 reactions to an already authorized inbound event.
+
+        This deliberately derives the target from the original Hermes event so
+        direct-message and MUC allowlists stay in force.  If the event lacks a
+        message id, the sender is unauthorized, reactions are disabled, or the
+        client/server does not support XEP-0444, the helper returns ``False``
+        without raising.
+        """
+        target = self._reaction_target_for_event(event)
+        if target is None:
+            return False
+        return await self._send_reactions_to_target(target, reactions)
+
+    async def _send_processing_reaction(self, target: XmppReactionTarget, reaction: str) -> None:
+        await self._send_reactions_to_target(target, (reaction,))
+
+    def _pick_processing_reaction(self, choices: tuple[str, ...]) -> str | None:
+        if not choices:
+            return None
+        return str(random.choice(choices))
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        target = self._reaction_target_for_event(event)
+        reaction = self._pick_processing_reaction(self.settings.reaction_start_choices)
+        if target is not None and reaction:
+            await self._send_processing_reaction(target, reaction)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        outcome_value = getattr(outcome, "value", str(outcome))
+        if outcome_value == "cancelled":
+            return
+        if outcome_value == "success":
+            reaction = self._pick_processing_reaction(self.settings.reaction_success_choices)
+        elif outcome_value == "failure":
+            reaction = self._pick_processing_reaction(self.settings.reaction_failure_choices)
+        else:
+            return
+        target = self._reaction_target_for_event(event)
+        if target is not None and reaction:
+            await self._send_processing_reaction(target, reaction)
 
     async def on_xmpp_message(self, msg: Any) -> None:
         parsed = parse_xmpp_message(msg, self.settings)

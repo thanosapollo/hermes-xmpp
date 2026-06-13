@@ -47,6 +47,25 @@ class PluginRegistrationTests(unittest.TestCase):
         missing = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "chat.example.org"})
         self.assertFalse(adapter.validate_config(missing))
 
+    def test_env_enablement_accepts_compatibility_aliases(self):
+        os.environ["XMPP_JID"] = "bot@example.org"
+        os.environ["XMPP_HOST"] = "chat.example.org"
+        os.environ["XMPP_PASSWORD"] = "secret"
+        os.environ["XMPP_MUC_ROOMS"] = "room@muc.example.org"
+        os.environ["XMPP_HOME_CHANNEL"] = "home@example.org"
+        os.environ["XMPP_REACTION_START_CHOICES"] = "👀,😘"
+
+        enabled = adapter._env_enablement()
+
+        if enabled is None:
+            self.fail("expected XMPP aliases to enable platform config")
+        extra = enabled["extra"]
+        self.assertEqual(extra["server"], "chat.example.org")
+        self.assertEqual(extra["rooms"], ["room@muc.example.org"])
+        self.assertEqual(extra["home_chat"], "home@example.org")
+        self.assertEqual(extra["reaction_start_choices"], ["👀", "😘"])
+        self.assertEqual(enabled["home_channel"]["chat_id"], "home@example.org")
+
     def test_standalone_sender_reports_unconfigured_without_crashing(self):
         cfg = types.SimpleNamespace(extra={})
         result = asyncio.run(adapter._standalone_send(cfg, "user@example.org", "hello"))

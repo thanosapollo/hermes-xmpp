@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import sys
 import types
 import unittest
 from unittest.mock import patch
@@ -66,6 +67,119 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.port, 5224)
         self.assertEqual(settings.password, "from-pass")
 
+    def test_fastfinge_env_aliases_are_accepted_without_renaming_primary_knobs(self):
+        os.environ["XMPP_JID"] = "bot@example.org"
+        os.environ["XMPP_HOST"] = "alias-host.example.org"
+        os.environ["XMPP_MUC_ROOMS"] = "room@muc.example.org,other@muc.example.org"
+        os.environ["XMPP_MUC_NICK"] = "AliasBot"
+        os.environ["XMPP_HOME_CHANNEL"] = "home@example.org"
+        os.environ["XMPP_MAX_MESSAGE_LENGTH"] = "1200"
+        settings = adapter.XmppSettings.from_config(types.SimpleNamespace(extra={"password": "secret"}))
+        self.assertEqual(settings.server, "alias-host.example.org")
+        self.assertEqual(settings.rooms, ["room@muc.example.org", "other@muc.example.org"])
+        self.assertEqual(settings.nickname, "AliasBot")
+        self.assertEqual(settings.home_chat, "home@example.org")
+        self.assertEqual(settings.text_chunk_limit, 1200)
+
+    def test_apply_yaml_config_accepts_top_level_alias_block(self):
+        result = adapter._apply_yaml_config(
+            {"xmpp": {"jid": "bot@example.org", "host": "yaml-host.example.org", "muc_rooms": ["room@muc.example.org"], "max_message_length": 900}},
+            {},
+        )
+        self.assertEqual(result["host"], "yaml-host.example.org")
+        self.assertEqual(os.environ["XMPP_JID"], "bot@example.org")
+        self.assertEqual(os.environ["XMPP_HOST"], "yaml-host.example.org")
+        self.assertEqual(os.environ["XMPP_MUC_ROOMS"], "room@muc.example.org")
+        self.assertEqual(os.environ["XMPP_MAX_MESSAGE_LENGTH"], "900")
+
+    def test_canonical_env_names_win_over_compatibility_aliases(self):
+        os.environ["XMPP_JID"] = "env@example.org"
+        os.environ["XMPP_SERVER"] = "canonical.example.org"
+        os.environ["XMPP_HOST"] = "alias.example.org"
+        os.environ["XMPP_ROOMS"] = "canonical@muc.example.org"
+        os.environ["XMPP_MUC_ROOMS"] = "alias@muc.example.org"
+        os.environ["XMPP_NICKNAME"] = "CanonicalNick"
+        os.environ["XMPP_MUC_NICK"] = "AliasNick"
+        os.environ["XMPP_HOME_CHAT"] = "canonical-home@example.org"
+        os.environ["XMPP_HOME_CHANNEL"] = "alias-home@example.org"
+        os.environ["XMPP_TEXT_CHUNK_LIMIT"] = "456"
+        os.environ["XMPP_MAX_MESSAGE_LENGTH"] = "123"
+        cfg = types.SimpleNamespace(extra={"password": "secret"})
+
+        settings = adapter.XmppSettings.from_config(cfg)
+
+        self.assertEqual(settings.server, "canonical.example.org")
+        self.assertEqual(settings.rooms, ["canonical@muc.example.org"])
+        self.assertEqual(settings.nickname, "CanonicalNick")
+        self.assertEqual(settings.home_chat, "canonical-home@example.org")
+        self.assertEqual(settings.text_chunk_limit, 456)
+
+    def test_processing_reactions_default_true_and_env_can_disable(self):
+        cfg = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "chat.example.org", "password": "secret"})
+        self.assertTrue(adapter.XmppSettings.from_config(cfg).reactions_enabled)
+        os.environ["XMPP_REACTIONS"] = "false"
+        self.assertFalse(adapter.XmppSettings.from_config(cfg).reactions_enabled)
+
+    def test_processing_reaction_choices_accept_env_and_yaml_lists(self):
+        cfg = types.SimpleNamespace(
+            extra={
+                "jid": "bot@example.org",
+                "server": "chat.example.org",
+                "password": "secret",
+                "reaction_success_choices": ["✅", "❤️"],
+                "reaction_failure_choices": "❌,💔",
+            }
+        )
+        os.environ["XMPP_REACTION_START_CHOICES"] = "👀,😘"
+
+        settings = adapter.XmppSettings.from_config(cfg)
+
+        self.assertEqual(settings.reaction_start_choices, ("👀", "😘"))
+        self.assertEqual(settings.reaction_success_choices, ("✅", "❤️"))
+        self.assertEqual(settings.reaction_failure_choices, ("❌", "💔"))
+
+    def test_empty_processing_reaction_choices_fall_back_to_defaults(self):
+        cfg = types.SimpleNamespace(
+            extra={
+                "jid": "bot@example.org",
+                "server": "chat.example.org",
+                "password": "secret",
+                "reaction_start_choices": "",
+                "reaction_success_choices": [],
+                "reaction_failure_choices": [],
+            }
+        )
+
+        settings = adapter.XmppSettings.from_config(cfg)
+
+        self.assertEqual(settings.reaction_start_choices, ("👀",))
+        self.assertEqual(settings.reaction_success_choices, ("✅",))
+        self.assertEqual(settings.reaction_failure_choices, ("❌",))
+
+    def test_tool_progress_bubble_limit_defaults_and_accepts_env(self):
+        cfg = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "chat.example.org", "password": "secret"})
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 30)
+        os.environ["XMPP_TOOL_PROGRESS_BUBBLE_LIMIT"] = "2"
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 2)
+
+    def test_editable_progress_policy_defaults_to_known_support_and_accepts_env(self):
+        cfg = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "chat.example.org", "password": "secret"})
+
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).editable_progress_policy, "known")
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).progress_delivery, "messages")
+
+        os.environ["XMPP_EDITABLE_PROGRESS"] = "force"
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).editable_progress_policy, "force")
+
+        os.environ["XMPP_PROGRESS_DELIVERY"] = "edit"
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).progress_delivery, "edit")
+
+        os.environ["XMPP_EDITABLE_PROGRESS"] = "nonsense"
+        os.environ["XMPP_PROGRESS_DELIVERY"] = "nonsense"
+        settings = adapter.XmppSettings.from_config(cfg)
+        self.assertEqual(settings.editable_progress_policy, "known")
+        self.assertEqual(settings.progress_delivery, "messages")
+
 
 class HelperTests(unittest.TestCase):
     def setUp(self):
@@ -93,6 +207,14 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(xmpp._strip_muc_mention("Emma: hello"), "hello")
         self.assertEqual(xmpp._strip_muc_mention("@Emma hello"), "hello")
         self.assertEqual(xmpp._strip_muc_mention("Emma, hello"), "hello")
+
+    def test_split_text_for_xmpp_prefers_readable_boundaries_and_preserves_content(self):
+        chunks = adapter.split_text_for_xmpp("alpha beta\ngamma delta", 11)
+        self.assertEqual(chunks, ["alpha beta", "gamma delta"])
+        hard_chunks = adapter.split_text_for_xmpp("abcdefghijkl", 5)
+        self.assertEqual(hard_chunks, ["abcde", "fghij", "kl"])
+        trailing_chunks = adapter.split_text_for_xmpp("abcde ", 5)
+        self.assertEqual(trailing_chunks, ["abcde"])
 
 
 class AuthorizationTests(unittest.TestCase):
@@ -336,6 +458,38 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         await xmpp.send_typing("thanos@example.org")
         await xmpp.stop_typing("thanos@example.org")
 
+    def test_slixmpp_client_enforces_starttls(self):
+        class FakeClientXMPP:
+            def __init__(self, jid, password):
+                self.jid = jid
+                self.password = password
+                self.boundjid = types.SimpleNamespace(resource="")
+                self.plugin = {}
+                self.use_starttls = False
+                self.force_starttls = False
+
+            def register_plugin(self, plugin):
+                self.plugin[plugin] = object()
+
+            def add_event_handler(self, *args, **kwargs):
+                return None
+
+        fake_slixmpp = types.SimpleNamespace(ClientXMPP=FakeClientXMPP)
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "resource": "hermes",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        with patch.dict(sys.modules, {"slixmpp": fake_slixmpp}):
+            thin = adapter._SlixmppClient(xmpp)
+
+        client = cast(Any, thin.client)
+        self.assertTrue(client.use_starttls)
+        self.assertTrue(client.force_starttls)
+
     async def test_slixmpp_upload_uses_plugin_indexing_not_dict_get(self):
         class FakeUploadPlugin:
             def __init__(self):
@@ -363,6 +517,57 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         result = await thin.upload_file("/tmp/file.bin", "application/octet-stream")
         self.assertEqual(result, "https://upload.example.org/file.bin")
         self.assertEqual(upload.calls, [("/tmp/file.bin", "application/octet-stream")])
+
+    async def test_slixmpp_reactions_use_xep_0444_and_missing_plugin_returns_false(self):
+        class FakeMessage:
+            def __init__(self, mto, mtype):
+                self.values = {"to": mto, "type": mtype, "reactions": {}}
+                self.sent = False
+                self.store_enabled = False
+
+            def __getitem__(self, key):
+                return self.values.setdefault(key, {})
+
+            def enable(self, key):
+                if key == "store":
+                    self.store_enabled = True
+
+            def send(self):
+                self.sent = True
+
+        class FakeReactionsPlugin:
+            def __init__(self):
+                self.calls = []
+
+            def set_reactions(self, msg, message_id, reactions):
+                self.calls.append((msg, message_id, tuple(reactions)))
+                msg.values["reactions"] = {"id": message_id, "values": tuple(reactions)}
+
+        class FakeClient:
+            def __init__(self, plugin):
+                self.plugin = plugin
+                self.messages = []
+
+            def make_message(self, mto, mtype):
+                msg = FakeMessage(mto, mtype)
+                self.messages.append(msg)
+                return msg
+
+        reactions_plugin = FakeReactionsPlugin()
+        thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        thin.client = FakeClient({"xep_0444": reactions_plugin})
+
+        sent = await thin.send_reactions("thanos@example.org", "m1", ("👀",), "chat")
+        missing_thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        missing_thin.client = FakeClient({})
+        missing = await missing_thin.send_reactions("thanos@example.org", "m1", ("👀",), "chat")
+
+        self.assertTrue(sent)
+        self.assertFalse(missing)
+        self.assertEqual(reactions_plugin.calls[0][1:], ("m1", ("👀",)))
+        self.assertEqual(thin.client.messages[0].values["reactions"], {"id": "m1", "values": ("👀",)})
+        self.assertTrue(thin.client.messages[0].store_enabled)
+        self.assertTrue(thin.client.messages[0].sent)
 
     async def test_slixmpp_send_message_puts_oob_on_same_stanza(self):
         class FakeMessage:
@@ -411,6 +616,311 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msg.values["oob"]["url"], "https://upload.example.org/image.png")
         self.assertEqual(msg.values["chat_state"], "active")
         self.assertEqual(thin.client.send_message_calls, [])
+
+    async def test_slixmpp_client_edit_message_sends_xep_0308_correction(self):
+        class FakeCorrectionPlugin:
+            def __init__(self):
+                self.calls = []
+
+            def set_correction(self, msg, message_id):
+                self.calls.append((msg, message_id))
+                msg.values["replace"] = {"id": message_id}
+
+        class FakeMsg:
+            def __init__(self):
+                self.values: dict[str, Any] = {"replace": {}}
+                self.sent = False
+
+            def __setitem__(self, key, value):
+                self.values[key] = value
+
+            def __getitem__(self, key):
+                self.values.setdefault(key, {})
+                return self.values[key]
+
+            def send(self):
+                self.sent = True
+
+        class FakeClient:
+            def __init__(self):
+                self.plugin = {"xep_0308": FakeCorrectionPlugin()}
+                self.messages = []
+
+            def make_message(self, *, mto=None, mbody=None, mtype=None):
+                msg = FakeMsg()
+                msg.values.update({"to": mto, "body": mbody, "type": mtype})
+                self.messages.append(msg)
+                return msg
+
+        thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        thin.client = FakeClient()
+        thin.adapter = types.SimpleNamespace(settings=types.SimpleNamespace(send_chat_states=True))
+
+        replacement_id = await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
+
+        self.assertTrue(replacement_id.startswith("hermes-"))
+        self.assertEqual(len(thin.client.messages), 1)
+        msg = thin.client.messages[0]
+        self.assertTrue(msg.sent)
+        self.assertEqual(msg.values["body"], "📖 read_file...")
+        self.assertEqual(msg.values["replace"], {"id": "msg-1"})
+        self.assertEqual(msg.values["chat_state"], "active")
+        self.assertEqual(thin.client.plugin["xep_0308"].calls, [(msg, "msg-1")])
+
+    async def test_slixmpp_client_edit_message_raises_when_xep_0308_missing(self):
+        class FakeClient:
+            plugin = {}
+
+        thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        thin.client = FakeClient()
+        thin.adapter = types.SimpleNamespace(settings=types.SimpleNamespace(send_chat_states=True))
+
+        with self.assertRaisesRegex(RuntimeError, "XEP-0308"):
+            await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
+
+    def test_adapter_declares_non_base_edit_message_for_gateway_progress(self):
+        self.assertIsNot(
+            type(adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))).edit_message,
+            adapter.BasePlatformAdapter.edit_message,
+        )
+
+    async def test_tool_progress_edits_existing_status_bubble_with_xep_0308(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "text_chunk_limit": 80,
+            "progress_delivery": "edit",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+                self.edits = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+            async def edit_message(self, to_jid, message_id, text, message_type):
+                self.edits.append((to_jid, message_id, text, message_type))
+                return f"edit-{len(self.edits)}"
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send("thanos@example.org", "🔍 search_files...", metadata={"chat_type": "dm"})
+        edit = await xmpp.edit_message(
+            chat_id="thanos@example.org",
+            message_id=cast(str, first.message_id),
+            content="🔍 search_files...\n📖 read_file...",
+            metadata={"chat_type": "dm"},
+        )
+        duplicate = await xmpp.edit_message(
+            chat_id="thanos@example.org",
+            message_id=cast(str, first.message_id),
+            content="🔍 search_files...\n📖 read_file...",
+            metadata={"chat_type": "dm"},
+        )
+
+        self.assertTrue(edit.success)
+        self.assertEqual(edit.message_id, first.message_id)
+        self.assertTrue(duplicate.success)
+        self.assertEqual(fake_client.messages, [
+            ("thanos@example.org", "🔍 search_files...", "chat", None, None),
+        ])
+        self.assertEqual(fake_client.edits, [
+            ("thanos@example.org", cast(str, first.message_id), "🔍 search_files...\n📖 read_file...", "chat"),
+        ])
+
+    async def test_tool_progress_edit_unsupported_fails_without_sending_extra_bubbles(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return False
+
+            async def edit_message(self, to_jid, message_id, text, message_type):
+                raise AssertionError("unsupported clients must be gated before sending correction stanzas")
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send("thanos@example.org", "🔍 search_files...")
+        result = await xmpp.edit_message(
+            chat_id="thanos@example.org",
+            message_id=cast(str, first.message_id),
+            content="🔍 search_files...\n📖 read_file...",
+        )
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        self.assertIn("not supported", cast(str, result.error))
+        self.assertEqual([call[1] for call in fake_client.messages], ["🔍 search_files..."])
+
+    async def test_send_or_update_status_defaults_to_visible_messages(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+                self.edits = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return True
+
+            async def edit_message(self, to_jid, message_id, text, message_type):
+                self.edits.append((to_jid, message_id, text, message_type))
+                return f"edit-{len(self.edits)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Thinking…")
+        second = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Still working…")
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual([call[1] for call in fake_client.messages], ["Thinking…", "Still working…"])
+        self.assertEqual(fake_client.edits, [])
+
+    async def test_send_or_update_status_edits_one_status_bubble_when_supported(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+                self.edits = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return True
+
+            async def edit_message(self, to_jid, message_id, text, message_type):
+                self.edits.append((to_jid, message_id, text, message_type))
+                return f"edit-{len(self.edits)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Thinking…")
+        second = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Still working…")
+        final = await xmpp.send("thanos@example.org", "normal final reply")
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.messages, [
+            ("thanos@example.org", "Thinking…", "chat", None, None),
+            ("thanos@example.org", "normal final reply", "chat", None, None),
+        ])
+        self.assertEqual(fake_client.edits, [
+            ("thanos@example.org", "msg-1", "Still working…", "chat"),
+        ])
+
+    async def test_send_or_update_status_edit_unsupported_falls_back_to_visible_messages(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return False
+
+            async def edit_message(self, to_jid, message_id, text, message_type):
+                raise AssertionError("unsupported clients must not receive correction stanzas")
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Thinking…")
+        second = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Still working…")
+        third = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Still still working…")
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertTrue(third.success)
+        self.assertEqual([call[1] for call in fake_client.messages], [
+            "Thinking…",
+            "Still working…",
+            "Still still working…",
+        ])
+
+    async def test_adapter_chunks_long_text_and_returns_continuation_ids(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "text_chunk_limit": 12,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        result = await xmpp.send("thanos@example.org", "hello brave little world", reply_to="orig-msg")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "msg-2")
+        self.assertEqual(result.continuation_message_ids, ("msg-1",))
+        self.assertEqual(fake_client.messages, [
+            ("thanos@example.org", "hello brave", "chat", "orig-msg", None),
+            ("thanos@example.org", "little world", "chat", None, None),
+        ])
 
     async def test_media_upload_deterministic_failures_are_not_retryable(self):
         cfg = types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"})
@@ -462,6 +972,29 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.messages, [
             ("thanos@example.org", "A tiny test\nhttps://upload.example.org/image.png", "chat", None, "https://upload.example.org/image.png")
         ])
+
+    async def test_adapter_chunks_oversized_text_and_reports_continuations(self):
+        cfg = types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret", "text_chunk_limit": 6})
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        result = await xmpp.send("thanos@example.org", "hello there friend", reply_to="root")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "msg-3")
+        self.assertEqual(result.continuation_message_ids, ("msg-1", "msg-2"))
+        self.assertEqual([call[1] for call in fake_client.messages], ["hello", "there", "friend"])
+        self.assertEqual([call[3] for call in fake_client.messages], ["root", None, None])
 
     def test_declared_media_kinds_tracks_future_fail_closed_gateway_api(self):
         old_media_kind = adapter.MediaKind
@@ -535,6 +1068,238 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             adapter.XMPPAdapter = old
 
         self.assertEqual(result, {"success": True, "message_id": "media-msg"})
+
+
+class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        clear_xmpp_env()
+
+    def tearDown(self):
+        clear_xmpp_env()
+
+    def _xmpp(self, **extra):
+        base = {
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "allowed_users": ["thanos@example.org"],
+            "nickname": "Emma",
+            "allowed_rooms": ["room@muc.example.org"],
+            "group_allow_from": ["thanos@example.org"],
+        }
+        base.update(extra)
+        return adapter.XMPPAdapter(types.SimpleNamespace(extra=base))
+
+    def _event(self, xmpp, msg):
+        parsed = adapter.parse_xmpp_message(msg, xmpp.settings)
+        source = xmpp.build_source(
+            chat_id=parsed.chat_id,
+            chat_name=parsed.chat_name,
+            chat_type=parsed.chat_type,
+            user_id=parsed.user_id,
+            user_name=parsed.user_name,
+            message_id=parsed.message_id,
+        )
+        return adapter.MessageEvent(
+            text=adapter.event_text_for(parsed, xmpp.settings),
+            message_type=adapter.MessageType.TEXT,
+            source=source,
+            raw_message=msg,
+            message_id=parsed.message_id,
+        )
+
+    async def test_configured_reaction_choices_are_selected_for_lifecycle_hooks(self):
+        xmpp = self._xmpp(
+            reaction_start_choices=["👀", "😘"],
+            reaction_success_choices=["✅", "❤️"],
+            reaction_failure_choices=["❌", "💔"],
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        msg = FakeMessage(body="hello", **{"from": "thanos@example.org/dino"}, type="chat", id="dm1")
+        event = self._event(xmpp, msg)
+
+        with patch.object(adapter.random, "choice", side_effect=lambda choices: choices[-1]):
+            await xmpp.on_processing_start(event)
+            await xmpp.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
+            await xmpp.on_processing_complete(event, adapter.ProcessingOutcome.FAILURE)
+
+        self.assertEqual(fake_client.calls, [
+            ("thanos@example.org/dino", "dm1", ("😘",), "chat"),
+            ("thanos@example.org/dino", "dm1", ("❤️",), "chat"),
+            ("thanos@example.org/dino", "dm1", ("💔",), "chat"),
+        ])
+
+    async def test_authorized_event_can_send_arbitrary_reactions(self):
+        xmpp = self._xmpp()
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        msg = FakeMessage(body="hello", **{"from": "thanos@example.org/dino"}, type="chat", id="dm-playful")
+        event = self._event(xmpp, msg)
+
+        sent = await xmpp.react_to_event(event, ["❤️", "😂"])
+
+        self.assertTrue(sent)
+        self.assertEqual(fake_client.calls, [
+            ("thanos@example.org/dino", "dm-playful", ("❤️", "😂"), "chat"),
+        ])
+
+    async def test_arbitrary_reaction_helper_keeps_auth_gate(self):
+        xmpp = self._xmpp()
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        msg = FakeMessage(body="hello", **{"from": "intruder@example.net/laptop"}, type="chat", id="dm-intruder")
+        event = self._event(xmpp, msg)
+
+        sent = await xmpp.react_to_event(event, ["❤️"])
+
+        self.assertFalse(sent)
+        self.assertEqual(fake_client.calls, [])
+
+    async def test_authorized_dm_gets_processing_start_and_success_reactions(self):
+        xmpp = self._xmpp()
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        msg = FakeMessage(body="hello", **{"from": "thanos@example.org/dino"}, type="chat", id="dm1")
+        event = self._event(xmpp, msg)
+
+        await xmpp.on_processing_start(event)
+        await xmpp.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
+
+        self.assertEqual(fake_client.calls, [
+            ("thanos@example.org/dino", "dm1", ("👀",), "chat"),
+            ("thanos@example.org/dino", "dm1", ("✅",), "chat"),
+        ])
+
+    async def test_unauthorized_sender_gets_no_processing_reactions(self):
+        xmpp = self._xmpp()
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        msg = FakeMessage(body="hello", **{"from": "intruder@example.net/laptop"}, type="chat", id="dm2")
+        event = self._event(xmpp, msg)
+
+        await xmpp.on_processing_start(event)
+        await xmpp.on_processing_complete(event, adapter.ProcessingOutcome.FAILURE)
+
+        self.assertEqual(fake_client.calls, [])
+
+    async def test_muc_reactions_follow_authorized_mention_policy(self):
+        xmpp = self._xmpp(muc_require_mention=True)
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        unauthorized = FakeMessage(
+            body="hello",
+            **{"from": "room@muc.example.org/thanos"},
+            type="groupchat",
+            id="muc1",
+            muc={"jid": "thanos@example.org"},
+            mucnick="thanos",
+        )
+        authorized = FakeMessage(
+            body="Emma: hello",
+            **{"from": "room@muc.example.org/thanos"},
+            type="groupchat",
+            id="muc2",
+            muc={"jid": "thanos@example.org"},
+            mucnick="thanos",
+        )
+
+        await xmpp.on_processing_start(self._event(xmpp, unauthorized))
+        await xmpp.on_processing_start(self._event(xmpp, authorized))
+
+        self.assertEqual(fake_client.calls, [
+            ("room@muc.example.org", "muc2", ("👀",), "groupchat"),
+        ])
+
+    async def test_failure_outcome_gets_cross_reaction(self):
+        xmpp = self._xmpp()
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                return True
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        msg = FakeMessage(body="hello", **{"from": "thanos@example.org/dino"}, type="chat", id="dm3")
+        event = self._event(xmpp, msg)
+
+        await xmpp.on_processing_complete(event, adapter.ProcessingOutcome.FAILURE)
+
+        self.assertEqual(fake_client.calls, [
+            ("thanos@example.org/dino", "dm3", ("❌",), "chat"),
+        ])
+
+    async def test_missing_xep_0444_fallback_does_not_break_processing_hooks(self):
+        xmpp = self._xmpp()
+
+        class FakeClient:
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+                return False
+
+        xmpp._client = FakeClient()
+        msg = FakeMessage(body="hello", **{"from": "thanos@example.org/dino"}, type="chat", id="dm4")
+        event = self._event(xmpp, msg)
+
+        await xmpp.on_processing_start(event)
+        await xmpp.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
 
 
 if __name__ == "__main__":
