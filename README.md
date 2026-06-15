@@ -20,7 +20,67 @@ Hermes community platform plugins use:
 - `adapter.py` with a `BasePlatformAdapter` subclass.
 - `register(ctx)` to call `ctx.register_platform(...)`.
 
-This repository keeps the adapter in `hermes_xmpp/adapter.py`. For local Hermes plugin discovery, symlink or copy the package directory into the operator's Hermes plugin directory only after review.
+This repository keeps the adapter in `hermes_xmpp/adapter.py`. For local Hermes plugin discovery, symlink or copy the repository into the operator's Hermes plugin directory only after review.
+
+## Installation
+
+### Requirements
+
+- Hermes Agent with plugin support.
+- Python 3.11+.
+- `slixmpp>=1.9,<2` available to the same Python environment that runs Hermes.
+- An XMPP account for the bot.
+
+### Install as a local Hermes plugin
+
+Clone the repository and expose it as `xmpp-platform` under the Hermes plugin directory:
+
+```sh
+git clone <repo-url> ~/Projects/hermes-xmpp
+mkdir -p ~/.hermes/plugins
+ln -sfn ~/Projects/hermes-xmpp ~/.hermes/plugins/xmpp-platform
+hermes plugins enable xmpp-platform
+```
+
+If you prefer copying instead of symlinking:
+
+```sh
+rm -rf ~/.hermes/plugins/xmpp-platform
+mkdir -p ~/.hermes/plugins/xmpp-platform
+rsync -a --exclude='.git' --exclude='__pycache__' --exclude='.pytest_cache' \
+  ~/Projects/hermes-xmpp/ ~/.hermes/plugins/xmpp-platform/
+hermes plugins enable xmpp-platform
+```
+
+Install the Python dependency in the Hermes runtime environment. For a venv-based Hermes install:
+
+```sh
+python -m pip install 'slixmpp>=1.9,<2'
+```
+
+For a Nix-packaged Hermes install, do not `pip install` into the immutable store. Add `slixmpp` to the Hermes wrapper/package environment declaratively, then rebuild the profile or Home Manager generation that provides `hermes`.
+
+### Configure credentials
+
+Prefer a password file or password command over putting a password directly in `.env`:
+
+```dotenv
+XMPP_JID="bot@example.org"
+XMPP_SERVER="chat.example.org"
+XMPP_RESOURCE="hermes"
+XMPP_PASSWORD_COMMAND="pass show xmpp/bot/password"
+XMPP_ALLOWED_USERS="user@example.org"
+XMPP_DM_POLICY="allowlist"
+XMPP_HOME_CHAT="user@example.org"
+```
+
+Then restart or run the Hermes gateway:
+
+```sh
+hermes gateway run --replace
+```
+
+A minimal standalone send smoke test can be done with Hermes' normal send-message tooling after the gateway/plugin is loaded, or by sending a direct message to the configured XMPP account and verifying Hermes replies.
 
 ## Configuration
 
