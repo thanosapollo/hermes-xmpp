@@ -136,3 +136,7 @@ optional_env:
     description: "Progress/status delivery: messages (default visible messages) or edit (XEP-0308 corrections)"
     prompt: "Progress delivery mode"
     password: false
+  - name: XMPP_EDITABLE_PROGRESS
+    description: "When progress delivery is edit: known (probe recipient support, default), force (always send XEP-0308), or disabled"
+    prompt: "Editable progress policy"
+    password: false

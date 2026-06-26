@@ -1302,5 +1302,242 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
         await xmpp.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
 
 
+class ThreadStanzaTests(unittest.IsolatedAsyncioTestCase):
+    """S1: thread_id must be written onto the XMPP stanza, not dropped."""
+
+    async def test_send_message_sets_thread_when_thread_id_given(self):
+        class FakeMessage:
+            def __init__(self):
+                self.values: dict[str, Any] = {}
+                self.sent = False
+
+            def __setitem__(self, key, value):
+                self.values[key] = value
+
+            def __getitem__(self, key):
+                return self.values.setdefault(key, {})
+
+            def send(self):
+                self.sent = True
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            def make_message(self, mto, mbody, mtype):
+                msg = FakeMessage()
+                msg.values.update({"to": mto, "body": mbody, "type": mtype})
+                self.messages.append(msg)
+                return msg
+
+        thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        thin.client = FakeClient()
+        thin.adapter = types.SimpleNamespace(settings=types.SimpleNamespace(send_chat_states=False))
+
+        await thin.send_message("thanos@example.org", "hi", "chat", thread_id="thread-123")
+
+        self.assertEqual(len(thin.client.messages), 1)
+        self.assertEqual(thin.client.messages[0].values["thread"], "thread-123")
+        self.assertTrue(thin.client.messages[0].sent)
+
+    async def test_send_message_omits_thread_when_thread_id_absent(self):
+        class FakeMessage:
+            def __init__(self):
+                self.values: dict[str, Any] = {}
+                self.sent = False
+
+            def __setitem__(self, key, value):
+                self.values[key] = value
+
+            def __getitem__(self, key):
+                return self.values.setdefault(key, {})
+
+            def send(self):
+                self.sent = True
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            def make_message(self, mto, mbody, mtype):
+                msg = FakeMessage()
+                msg.values.update({"to": mto, "body": mbody, "type": mtype})
+                self.messages.append(msg)
+                return msg
+
+        thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        thin.client = FakeClient()
+        thin.adapter = types.SimpleNamespace(settings=types.SimpleNamespace(send_chat_states=False))
+
+        await thin.send_message("thanos@example.org", "hi", "chat")
+
+        self.assertEqual(len(thin.client.messages), 1)
+        self.assertNotIn("thread", thin.client.messages[0].values)
+
+
+class JoinMucRoomTests(unittest.IsolatedAsyncioTestCase):
+    """S3: prefer join_muc_wait, fall back to join_muc."""
+
+    async def test_prefers_join_muc_wait_when_available(self):
+        class FakeMuc:
+            def __init__(self):
+                self.wait_called = False
+                self.join_called = False
+
+            async def join_muc_wait(self, room, nick):
+                self.wait_called = True
+                self.wait_args = (room, nick)
+
+            def join_muc(self, room, nick):
+                self.join_called = True
+
+        muc = FakeMuc()
+        await adapter._join_muc_room(muc, "room@conference.example.org", "emma")
+        self.assertTrue(muc.wait_called)
+        self.assertFalse(muc.join_called)
+        self.assertEqual(muc.wait_args, ("room@conference.example.org", "emma"))
+
+    async def test_falls_back_to_join_muc_when_wait_missing(self):
+        class FakeMuc:
+            def __init__(self):
+                self.join_called = False
+
+            def join_muc(self, room, nick):
+                self.join_called = True
+                self.join_args = (room, nick)
+
+        muc = FakeMuc()
+        await adapter._join_muc_room(muc, "room@conference.example.org", "emma")
+        self.assertTrue(muc.join_called)
+        self.assertEqual(muc.join_args, ("room@conference.example.org", "emma"))
+
+    async def test_falls_back_to_join_muc_when_wait_raises(self):
+        class FakeMuc:
+            def __init__(self):
+                self.join_called = False
+
+            async def join_muc_wait(self, room, nick):
+                raise RuntimeError("server rejected join")
+
+            def join_muc(self, room, nick):
+                self.join_called = True
+
+        muc = FakeMuc()
+        await adapter._join_muc_room(muc, "room@conference.example.org", "emma")
+        self.assertTrue(muc.join_called)
+
+
+class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
+    """S4: XMPP identity lock prevents two profiles on the same JID:resource."""
+
+    def _cfg(self):
+        return types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "resource": "hermes",
+        })
+
+    async def test_connect_returns_false_on_lock_conflict(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(False, "emma@example.org:hermes")):
+            ok = await xmpp.connect()
+
+        self.assertFalse(ok)
+        self.assertEqual(xmpp.fatal_error_message, "XMPP identity in use by another profile")
+        self.assertIsNone(xmpp._client)
+        self.assertIsNone(xmpp._lock_key)
+
+    async def test_connect_acquires_lock_then_proceeds(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeThinClient:
+            def __init__(self, _adapter):
+                pass
+
+            async def connect(self):
+                return True
+
+        with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
+             patch.object(adapter, "_SlixmppClient", FakeThinClient), \
+             patch.object(adapter, "check_requirements", return_value=True):
+            ok = await xmpp.connect()
+
+        self.assertTrue(ok)
+        self.assertEqual(xmpp._lock_key, "emma@example.org:hermes")
+
+    async def test_disconnect_releases_lock(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        xmpp._lock_key = "emma@example.org:hermes"
+
+        with patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            await xmpp.disconnect()
+
+        release.assert_called_once_with("emma@example.org:hermes")
+        self.assertIsNone(xmpp._lock_key)
+
+    async def test_connect_failure_releases_lock(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FailingThinClient:
+            def __init__(self, _adapter):
+                pass
+
+            async def connect(self):
+                raise RuntimeError("connection refused")
+
+        with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
+             patch.object(adapter, "_SlixmppClient", FailingThinClient), \
+             patch.object(adapter, "check_requirements", return_value=True):
+            ok = await xmpp.connect()
+
+        self.assertFalse(ok)
+        self.assertIsNone(xmpp._client)
+        # Lock must be released so a retry is not blocked by a stale lock.
+        self.assertIsNone(xmpp._lock_key)
+
+    def test_acquire_lock_fails_open_without_status_module(self):
+        # In the unit-test environment gateway.status is not importable, so the
+        # lock helper must fail open and let the adapter proceed.
+        acquired, key = adapter._acquire_xmpp_identity_lock("emma@example.org", "hermes")
+        self.assertTrue(acquired)
+        self.assertIsNone(key)
+
+    def test_lock_key_uses_bare_jid_and_resource(self):
+        self.assertEqual(
+            adapter._xmpp_identity_lock_key("Emma@Example.ORG/laptop", "hermes"),
+            "emma@example.org:hermes",
+        )
+
+
+class PasswordCommandDiagnosticsTests(unittest.TestCase):
+    """N3: password-command failures must surface stderr, not swallow it."""
+
+    def test_surfaces_stderr_on_nonzero_exit(self):
+        completed = __import__("subprocess").CompletedProcess(
+            args=["gpg"], returncode=2, stdout="", stderr="gpg: agent locked"
+        )
+        with patch("subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as ctx:
+                adapter._read_secret_command("gpg --decrypt pw")
+        self.assertIn("exited 2", str(ctx.exception))
+        self.assertIn("gpg: agent locked", str(ctx.exception))
+
+    def test_returns_stdout_on_success(self):
+        completed = __import__("subprocess").CompletedProcess(
+            args=["pass"], returncode=0, stdout="s3cr3t\n", stderr=""
+        )
+        with patch("subprocess.run", return_value=completed):
+            self.assertEqual(adapter._read_secret_command("pass show xmpp"), "s3cr3t")
+
+    def test_empty_command_returns_empty(self):
+        self.assertEqual(adapter._read_secret_command(""), "")
+
+
 if __name__ == "__main__":
     unittest.main()

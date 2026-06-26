@@ -5,6 +5,7 @@ Hermes-native adapter code; OpenClaw is only a behavior reference.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import inspect
 import mimetypes
@@ -164,10 +165,65 @@ def _read_secret_file(path: str) -> str:
 
 
 def _read_secret_command(command: str) -> str:
+    """Run a password command and return its stdout.
+
+    On failure, surface stderr in the exception so operators can diagnose a
+    locked GPG agent or a misconfigured ``pass`` entry instead of seeing an
+    empty password. The password itself is never written to logs.
+    """
     args = shlex.split(command)
     if not args:
         return ""
-    return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL).strip()
+    result = subprocess.run(args, text=True, capture_output=True)
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(
+            f"password command {args[0]!r} exited {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    return result.stdout.strip()
+
+
+def _xmpp_identity_lock_key(jid: str, resource: str) -> str:
+    return f"{_bare_jid(jid)}:{resource or 'hermes'}"
+
+
+def _acquire_xmpp_identity_lock(jid: str, resource: str) -> tuple[bool, str | None]:
+    """Acquire a machine-local lock keyed by JID:resource.
+
+    Mirrors the IRC adapter's ``acquire_scoped_lock("irc", ...)``: prevents two
+    local Hermes profiles from binding the same XMPP identity at once (which
+    would kick each other off via XMPP resource conflict). Fails open (returns
+    ``(True, None)``) when the Hermes status module is unavailable or errors, so
+    the adapter still connects in environments without the lock infrastructure.
+    """
+    lock_key = _xmpp_identity_lock_key(jid, resource)
+    try:
+        from gateway.status import acquire_scoped_lock
+    except ImportError:
+        return True, None  # status module not available (tests, standalone)
+    try:
+        result: Any = acquire_scoped_lock("xmpp", lock_key, metadata={"platform": "xmpp"})
+    except Exception:
+        logger.debug("XMPP: scoped identity lock acquire failed for %s", lock_key, exc_info=True)
+        return True, None
+    # acquire_scoped_lock returns a (acquired, existing) tuple in current Hermes;
+    # older call sites treated it as a plain bool. Normalize both shapes.
+    if isinstance(result, tuple):
+        acquired = bool(result[0]) if result else False
+    else:
+        acquired = bool(result)
+    return acquired, lock_key
+
+
+def _release_xmpp_identity_lock(lock_key: str | None) -> None:
+    if not lock_key:
+        return
+    try:
+        from gateway.status import release_scoped_lock
+        release_scoped_lock("xmpp", lock_key)
+    except Exception:
+        logger.debug("XMPP: scoped identity lock release failed for %s", lock_key, exc_info=True)
 
 
 def _resolve_password(extra: dict[str, Any]) -> str:
@@ -789,6 +845,31 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> Optional[dict[str,
     return extra
 
 
+async def _join_muc_room(muc_plugin: Any, room: str, nick: str) -> None:
+    """Join a MUC room, preferring ``join_muc_wait`` when available.
+
+    ``join_muc`` is deprecated in slixmpp >= 1.8.0 and is scheduled for removal
+    in favour of ``join_muc_wait`` (which also awaits join confirmation).
+    Prefer the new coroutine when present; fall back to ``join_muc`` for older
+    slixmpp versions or if the wait variant fails at runtime.
+    """
+    join_wait = getattr(muc_plugin, "join_muc_wait", None)
+    if callable(join_wait):
+        try:
+            awaitable: Any = join_wait(room, nick)
+            if inspect.isawaitable(awaitable):
+                await asyncio.wait_for(awaitable, timeout=30)
+            return
+        except asyncio.TimeoutError:
+            logger.warning("XMPP: timed out waiting for MUC join confirmation for %s; retrying without wait", room)
+        except Exception:
+            logger.debug("XMPP: join_muc_wait failed for %s, falling back to join_muc", room, exc_info=True)
+    try:
+        muc_plugin.join_muc(room, nick)
+    except Exception:
+        logger.warning("XMPP: failed joining MUC %s", room, exc_info=True)
+
+
 class _SlixmppClient:  # pragma: no cover - live protocol path
     """Thin wrapper around slixmpp to keep Hermes adapter code focused."""
 
@@ -828,6 +909,11 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         message_id = f"hermes-{uuid.uuid4().hex}"
         msg = self.client.make_message(mto=to_jid, mbody=text, mtype=message_type)
         msg["id"] = message_id
+        if thread_id:
+            # XEP-0201: carry the conversation thread so clients can group
+            # Hermes' replies with the originating message. Without this the
+            # reply_to/thread_id Hermes forwards is silently dropped.
+            msg["thread"] = thread_id
         if self.adapter.settings.send_chat_states and message_type == "chat":
             # XEP-0085: advertise support and mark the conversation active on
             # normal replies. This mirrors client behavior expected by Dino and
@@ -962,9 +1048,11 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         await self.client.get_roster()
         for room in self.adapter.settings.rooms:
             try:
-                self.client.plugin["xep_0045"].join_muc(room, self.adapter.settings.nickname)
+                muc = self.client.plugin["xep_0045"]
             except Exception:
-                logger.warning("XMPP: failed joining MUC %s", room, exc_info=True)
+                logger.warning("XMPP: xep_0045 (MUC) plugin unavailable; cannot join %s", room)
+                continue
+            await _join_muc_room(muc, room, self.adapter.settings.nickname)
 
     async def _on_message(self, msg: Any) -> None:
         await self.adapter.on_xmpp_message(msg)
@@ -1038,6 +1126,7 @@ class XMPPAdapter(BasePlatformAdapter):
         self._tool_progress_bubbles_sent = 0
         self._status_message_ids: dict[tuple[str, str], str] = {}
         self._disabled_status_keys: set[tuple[str, str]] = set()
+        self._lock_key: str | None = None
 
     @property
     def name(self) -> str:
@@ -1055,12 +1144,22 @@ class XMPPAdapter(BasePlatformAdapter):
             self._set_fatal_error("dependency_missing", "Install hermes-xmpp with slixmpp", retryable=False)
             return False
 
+        acquired, lock_key = _acquire_xmpp_identity_lock(self.settings.jid, self.settings.resource)
+        if not acquired:
+            logger.error("XMPP: %s/%s already in use by another profile", self.settings.jid, self.settings.resource)
+            self._set_fatal_error("lock_conflict", "XMPP identity in use by another profile", retryable=False)
+            return False
+        self._lock_key = lock_key
+
         self._client = _SlixmppClient(self)
         try:
             ok = await self._client.connect()
         except Exception as exc:
             logger.error("XMPP: failed to connect as %s: %s", self.settings.jid, exc)
             self._set_fatal_error("connect_failed", str(exc), retryable=True)
+            self._client = None
+            _release_xmpp_identity_lock(self._lock_key)
+            self._lock_key = None
             return False
         self._mark_connected()
         return ok
@@ -1070,6 +1169,8 @@ class XMPPAdapter(BasePlatformAdapter):
         if self._client:
             await self._client.disconnect()
         self._client = None
+        _release_xmpp_identity_lock(self._lock_key)
+        self._lock_key = None
 
     async def send(
         self,
