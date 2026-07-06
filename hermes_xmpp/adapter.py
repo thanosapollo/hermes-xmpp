@@ -1136,7 +1136,11 @@ class XMPPAdapter(BasePlatformAdapter):
     def enforces_own_access_policy(self) -> bool:
         return True
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Hermes core passes ``is_reconnect`` on startup/retry. XMPP does not need
+        # different queue semantics, but accepting it keeps the adapter contract
+        # compatible with newer gateway reconnection code.
+        _ = is_reconnect
         if not validate_config(self.config):
             self._set_fatal_error("config_missing", "XMPP_JID, XMPP_SERVER, and password are required", retryable=False)
             return False

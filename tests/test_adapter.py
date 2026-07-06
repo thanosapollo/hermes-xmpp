@@ -1469,6 +1469,25 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual(xmpp._lock_key, "emma@example.org:hermes")
 
+    async def test_connect_accepts_gateway_reconnect_keyword(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeThinClient:
+            def __init__(self, _adapter):
+                pass
+
+            async def connect(self):
+                return True
+
+        with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
+             patch.object(adapter, "_SlixmppClient", FakeThinClient), \
+             patch.object(adapter, "check_requirements", return_value=True):
+            ok = await xmpp.connect(is_reconnect=True)
+
+        self.assertTrue(ok)
+        self.assertEqual(xmpp._lock_key, "emma@example.org:hermes")
+
     async def test_disconnect_releases_lock(self):
         cfg = self._cfg()
         xmpp = adapter.XMPPAdapter(cfg)
