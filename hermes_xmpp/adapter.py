@@ -399,6 +399,13 @@ class XmppSettings:
                 os.getenv("XMPP_ALLOWED_ROOMS") or extra.get("allowed_rooms", room_values)
             )
         }
+        tool_progress_parsed = _int_or_none(
+            _first_env_or_config(
+                extra,
+                ("XMPP_TOOL_PROGRESS_BUBBLE_LIMIT",),
+                ("tool_progress_bubble_limit",),
+            )
+        )
         return cls(
             jid=jid,
             server=str(
@@ -496,14 +503,7 @@ class XmppSettings:
                 )
             )
             or 4000,
-            tool_progress_bubble_limit=_int_or_none(
-                _first_env_or_config(
-                    extra,
-                    ("XMPP_TOOL_PROGRESS_BUBBLE_LIMIT",),
-                    ("tool_progress_bubble_limit",),
-                )
-            )
-            or 30,
+            tool_progress_bubble_limit=30 if tool_progress_parsed is None else tool_progress_parsed,
             editable_progress_policy=_normalize_policy(
                 os.getenv("XMPP_EDITABLE_PROGRESS") or extra.get("editable_progress_policy", extra.get("editable_progress")),
                 "known",
@@ -1161,6 +1161,7 @@ class XMPPAdapter(BasePlatformAdapter):
         self._tool_progress_bubbles_sent = 0
         self._status_message_ids: dict[tuple[str, str], str] = {}
         self._disabled_status_keys: set[tuple[str, str]] = set()
+        self._status_progress_lock = asyncio.Lock()
         self._lock_key: str | None = None
         self._operator_disconnect = False
 
@@ -1334,56 +1335,57 @@ class XMPPAdapter(BasePlatformAdapter):
         later calls edit it, and permanent edit failures fall back to a fresh
         visible send instead of disappearing.
         """
-        key = (str(chat_id), str(status_key))
-        if key in self._disabled_status_keys:
-            return SendResult(
-                success=False,
-                error="XMPP editable status is disabled for this chat/status key",
-                retryable=False,
-            )
-        limit = self.settings.tool_progress_bubble_limit
-        if limit >= 0 and self._tool_progress_bubbles_sent >= limit:
-            self._disabled_status_keys.add(key)
-            return SendResult(
-                success=False,
-                error="XMPP editable status is disabled for this chat/status key",
-                retryable=False,
-            )
-
-        def _record_progress_success() -> None:
-            self._tool_progress_bubbles_sent += 1
+        async with self._status_progress_lock:
+            key = (str(chat_id), str(status_key))
+            if key in self._disabled_status_keys:
+                return SendResult(
+                    success=False,
+                    error="XMPP editable status is disabled for this chat/status key",
+                    retryable=False,
+                )
+            limit = self.settings.tool_progress_bubble_limit
             if limit >= 0 and self._tool_progress_bubbles_sent >= limit:
                 self._disabled_status_keys.add(key)
+                return SendResult(
+                    success=False,
+                    error="XMPP editable status is disabled for this chat/status key",
+                    retryable=False,
+                )
 
-        if self.settings.progress_delivery != "edit":
-            result = await self.send(chat_id, content, metadata=metadata)
-            if result.success:
-                _record_progress_success()
-            return result
-        cached_id = self._status_message_ids.get(key)
-        if cached_id:
-            result = await self.edit_message(chat_id, cached_id, content, metadata=metadata)
-            if result.success:
-                if result.message_id:
-                    self._status_message_ids[key] = str(result.message_id)
-                _record_progress_success()
-                return result
-            if not result.retryable:
-                # Mirror Telegram's status fallback: if a correction cannot be
-                # applied, clear the stale id and send a fresh visible status
-                # instead of silently dropping future status callbacks.
-                self._status_message_ids.pop(key, None)
-                fresh = await self.send(chat_id, content, metadata=metadata)
-                if fresh.success and fresh.message_id:
-                    self._status_message_ids[key] = str(fresh.message_id)
+            def _record_progress_success() -> None:
+                self._tool_progress_bubbles_sent += 1
+                if limit >= 0 and self._tool_progress_bubbles_sent >= limit:
+                    self._disabled_status_keys.add(key)
+
+            if self.settings.progress_delivery != "edit":
+                result = await self.send(chat_id, content, metadata=metadata)
+                if result.success:
                     _record_progress_success()
-                return fresh
+                return result
+            cached_id = self._status_message_ids.get(key)
+            if cached_id:
+                result = await self.edit_message(chat_id, cached_id, content, metadata=metadata)
+                if result.success:
+                    if result.message_id:
+                        self._status_message_ids[key] = str(result.message_id)
+                    _record_progress_success()
+                    return result
+                if not result.retryable:
+                    # Mirror Telegram's status fallback: if a correction cannot be
+                    # applied, clear the stale id and send a fresh visible status
+                    # instead of silently dropping future status callbacks.
+                    self._status_message_ids.pop(key, None)
+                    fresh = await self.send(chat_id, content, metadata=metadata)
+                    if fresh.success and fresh.message_id:
+                        self._status_message_ids[key] = str(fresh.message_id)
+                        _record_progress_success()
+                    return fresh
+                return result
+            result = await self.send(chat_id, content, metadata=metadata)
+            if result.success and result.message_id:
+                self._status_message_ids[key] = str(result.message_id)
+                _record_progress_success()
             return result
-        result = await self.send(chat_id, content, metadata=metadata)
-        if result.success and result.message_id:
-            self._status_message_ids[key] = str(result.message_id)
-            _record_progress_success()
-        return result
 
     async def edit_message(
         self,

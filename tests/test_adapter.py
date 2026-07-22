@@ -161,6 +161,17 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 30)
         os.environ["XMPP_TOOL_PROGRESS_BUBBLE_LIMIT"] = "2"
         self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 2)
+        os.environ["XMPP_TOOL_PROGRESS_BUBBLE_LIMIT"] = "0"
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 0)
+        cfg_zero = types.SimpleNamespace(
+            extra={
+                "jid": "bot@example.org",
+                "server": "chat.example.org",
+                "password": "secret",
+                "tool_progress_bubble_limit": 0,
+            }
+        )
+        self.assertEqual(adapter.XmppSettings.from_config(cfg_zero).tool_progress_bubble_limit, 0)
 
     def test_editable_progress_policy_defaults_to_known_support_and_accepts_env(self):
         cfg = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "chat.example.org", "password": "secret"})
@@ -1006,6 +1017,82 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("disabled", cast(str, third.error).lower())
         self.assertEqual(len(fake_client.messages), 1)
         self.assertEqual(len(fake_client.edits), 1)
+
+    async def test_tool_progress_limit_zero_disables_first_status_update(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "tool_progress_bubble_limit": 0,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        result = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "blocked")
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        self.assertIn("disabled", cast(str, result.error).lower())
+        self.assertEqual(fake_client.messages, [])
+        self.assertIn(("thanos@example.org", "lifecycle"), xmpp._disabled_status_keys)
+        self.assertEqual(xmpp._tool_progress_bubbles_sent, 0)
+
+    async def test_tool_progress_limit_is_atomic_across_concurrent_updates(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "tool_progress_bubble_limit": 1,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+        release = __import__("asyncio").Event()
+        started = __import__("asyncio").Event()
+
+        class BlockingClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                started.set()
+                await release.wait()
+                return f"msg-{len(self.messages)}"
+
+        fake_client = BlockingClient()
+        xmpp._client = cast(Any, fake_client)
+        loop = __import__("asyncio").get_event_loop()
+
+        first_task = loop.create_task(
+            xmpp.send_or_update_status("a@example.org", "one", "first")
+        )
+        await started.wait()
+        second_task = loop.create_task(
+            xmpp.send_or_update_status("b@example.org", "two", "second")
+        )
+        # Give the second caller a chance to race the unlocked path if present.
+        await __import__("asyncio").sleep(0)
+        release.set()
+        first, second = await __import__("asyncio").gather(first_task, second_task)
+
+        successes = [result for result in (first, second) if result.success]
+        failures = [result for result in (first, second) if not result.success]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertFalse(failures[0].retryable)
+        self.assertIn("disabled", cast(str, failures[0].error).lower())
+        self.assertEqual(xmpp._tool_progress_bubbles_sent, 1)
+        self.assertEqual(len(fake_client.messages), 1)
+        self.assertEqual(len(xmpp._disabled_status_keys), 2)
 
     async def test_adapter_chunks_long_text_and_returns_continuation_ids(self):
         cfg = types.SimpleNamespace(extra={

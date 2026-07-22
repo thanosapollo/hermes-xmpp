@@ -141,7 +141,7 @@ optional_env:
     prompt: "Editable progress policy"
     password: false
   - name: XMPP_TOOL_PROGRESS_BUBBLE_LIMIT
-    description: "Max tool-progress/status updates via send_or_update_status before that chat/status key is disabled; default 30"
+    description: "Max tool-progress/status updates via send_or_update_status before that chat/status key is disabled; default 30; 0 disables immediately"
     prompt: "Tool progress bubble limit"
     password: false
   - name: XMPP_ANONYMOUS_MUC_POLICY
