@@ -199,7 +199,16 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(adapter._normalize_target("xmpp:group:room@conference.example.org"), "room@conference.example.org")
         self.assertTrue(adapter._is_group_jid("room@conference.example.org"))
         self.assertTrue(adapter._is_group_jid("room@muc.example.org"))
+        self.assertTrue(adapter._is_group_jid("room@rooms.example.org"))
+        self.assertTrue(adapter._is_group_jid("room@groupchat.example.org"))
+        self.assertTrue(adapter._is_group_jid("room@foo.muc.example.org"))
+        self.assertTrue(adapter._is_group_jid("room:local-id"))
         self.assertFalse(adapter._is_group_jid("user@example.org"))
+        # Substring traps: domain labels must match whole labels, not fragments.
+        self.assertFalse(adapter._is_group_jid("user@notmuc.example.org"))
+        self.assertFalse(adapter._is_group_jid("user@myconference.example.org"))
+        self.assertFalse(adapter._is_group_jid("user@mucous.example.org"))
+        self.assertFalse(adapter._is_group_jid("user@conferencex.example.org"))
 
     def test_mention_stripping_accepts_colon_comma_and_at_forms(self):
         cfg = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "s", "password": "p", "nickname": "Emma"})
@@ -929,6 +938,75 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "Still still working…",
         ])
 
+    async def test_send_uses_chat_type_for_domains_that_only_substring_match_muc(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        result = await xmpp.send("user@notmuc.example.org", "hello")
+
+        self.assertTrue(result.success)
+        self.assertEqual(fake_client.messages, [
+            ("user@notmuc.example.org", "hello", "chat", None, None),
+        ])
+
+    async def test_send_or_update_status_enforces_tool_progress_bubble_limit(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+            "tool_progress_bubble_limit": 2,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+                self.edits = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
+                return f"msg-{len(self.messages)}"
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return True
+
+            async def edit_message(self, to_jid, message_id, text, message_type):
+                self.edits.append((to_jid, message_id, text, message_type))
+                return f"edit-{len(self.edits)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "one")
+        second = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "two")
+        third = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "three")
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(xmpp._tool_progress_bubbles_sent, 2)
+        self.assertIn(("thanos@example.org", "lifecycle"), xmpp._disabled_status_keys)
+        self.assertFalse(third.success)
+        self.assertFalse(third.retryable)
+        self.assertIn("disabled", cast(str, third.error).lower())
+        self.assertEqual(len(fake_client.messages), 1)
+        self.assertEqual(len(fake_client.edits), 1)
+
     async def test_adapter_chunks_long_text_and_returns_continuation_ids(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
@@ -1570,6 +1648,30 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         release.assert_called_once_with("emma@example.org:hermes")
         self.assertIsNone(xmpp._client)
         self.assertIsNone(xmpp._lock_key)
+
+    async def test_fallback_base_notify_fatal_error_invokes_handler_without_monkeypatch(self):
+        """Unit-test BasePlatformAdapter stub must expose Hermes' notify hook."""
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        client = object()
+        xmpp._client = cast(Any, client)
+        xmpp._lock_key = "emma@example.org:hermes"
+        notifications = []
+
+        def set_fatal_error(code, message, retryable=False):
+            pass
+
+        async def fatal_handler(adapter_self):
+            notifications.append(adapter_self)
+
+        xmpp._set_fatal_error = set_fatal_error
+        xmpp._fatal_error_handler = fatal_handler
+        # Intentionally do not monkeypatch _notify_fatal_error.
+
+        with patch.object(adapter, "_release_xmpp_identity_lock"):
+            await xmpp.on_xmpp_disconnected(ConnectionError("socket lost"), client=client)
+
+        self.assertEqual(notifications, [xmpp])
 
     async def test_explicit_disconnect_does_not_notify_reconnect_handler(self):
         cfg = self._cfg()

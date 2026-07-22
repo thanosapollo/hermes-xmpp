@@ -85,6 +85,16 @@ except Exception:  # pragma: no cover - static/unit-test fallback outside Hermes
         async def edit_message(self, chat_id: str, message_id: str, content: str, **_: Any) -> SendResult:
             return SendResult(success=False, error="message editing is not supported")
 
+        async def _notify_fatal_error(self) -> None:
+            # Mirror Hermes BasePlatformAdapter so unit tests exercise disconnect
+            # recovery without monkeypatching the notify hook away.
+            handler = getattr(self, "_fatal_error_handler", None)
+            if not handler:
+                return
+            result = handler(self)
+            if asyncio.iscoroutine(result):
+                await result
+
 
 def _split_csv(value: Any) -> list[str]:
     if value is None:
@@ -148,8 +158,10 @@ def _is_group_jid(jid: str) -> bool:
     if bare.startswith("room:"):
         return True
     domain = bare.split("@", 1)[1] if "@" in bare else bare
-    markers = ("conference.", "muc.", "rooms.", "groupchat.", ".conference.", ".muc.")
-    return any(marker in domain for marker in markers)
+    # Match whole DNS labels only. Substring checks false-positive
+    # domains like notmuc.example.org / myconference.example.org.
+    muc_labels = {"conference", "muc", "rooms", "groupchat"}
+    return any(label in muc_labels for label in domain.split(".") if label)
 
 
 def _matches_jid(jid: str, patterns: set[str] | list[str] | tuple[str, ...]) -> bool:
@@ -1322,8 +1334,6 @@ class XMPPAdapter(BasePlatformAdapter):
         later calls edit it, and permanent edit failures fall back to a fresh
         visible send instead of disappearing.
         """
-        if self.settings.progress_delivery != "edit":
-            return await self.send(chat_id, content, metadata=metadata)
         key = (str(chat_id), str(status_key))
         if key in self._disabled_status_keys:
             return SendResult(
@@ -1331,12 +1341,32 @@ class XMPPAdapter(BasePlatformAdapter):
                 error="XMPP editable status is disabled for this chat/status key",
                 retryable=False,
             )
+        limit = self.settings.tool_progress_bubble_limit
+        if limit >= 0 and self._tool_progress_bubbles_sent >= limit:
+            self._disabled_status_keys.add(key)
+            return SendResult(
+                success=False,
+                error="XMPP editable status is disabled for this chat/status key",
+                retryable=False,
+            )
+
+        def _record_progress_success() -> None:
+            self._tool_progress_bubbles_sent += 1
+            if limit >= 0 and self._tool_progress_bubbles_sent >= limit:
+                self._disabled_status_keys.add(key)
+
+        if self.settings.progress_delivery != "edit":
+            result = await self.send(chat_id, content, metadata=metadata)
+            if result.success:
+                _record_progress_success()
+            return result
         cached_id = self._status_message_ids.get(key)
         if cached_id:
             result = await self.edit_message(chat_id, cached_id, content, metadata=metadata)
             if result.success:
                 if result.message_id:
                     self._status_message_ids[key] = str(result.message_id)
+                _record_progress_success()
                 return result
             if not result.retryable:
                 # Mirror Telegram's status fallback: if a correction cannot be
@@ -1346,11 +1376,13 @@ class XMPPAdapter(BasePlatformAdapter):
                 fresh = await self.send(chat_id, content, metadata=metadata)
                 if fresh.success and fresh.message_id:
                     self._status_message_ids[key] = str(fresh.message_id)
+                    _record_progress_success()
                 return fresh
             return result
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
             self._status_message_ids[key] = str(result.message_id)
+            _record_progress_success()
         return result
 
     async def edit_message(
