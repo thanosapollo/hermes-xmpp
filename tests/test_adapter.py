@@ -490,6 +490,43 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.use_starttls)
         self.assertTrue(client.force_starttls)
 
+    def test_slixmpp_client_registers_disconnect_lifecycle_handlers(self):
+        class FakeClientXMPP:
+            def __init__(self, jid, password):
+                self.jid = jid
+                self.password = password
+                self.boundjid = types.SimpleNamespace(resource="")
+                self.plugin = {}
+                self.handlers = {}
+
+            def register_plugin(self, plugin):
+                self.plugin[plugin] = object()
+
+            def add_event_handler(self, event_name, handler, *args, **kwargs):
+                self.handlers[event_name] = handler
+
+            def is_connected(self):
+                return True
+
+        fake_slixmpp = types.SimpleNamespace(ClientXMPP=FakeClientXMPP)
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "resource": "hermes",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        with patch.dict(sys.modules, {"slixmpp": fake_slixmpp}):
+            thin = adapter._SlixmppClient(xmpp)
+
+        client = cast(Any, thin.client)
+        self.assertIn("session_start", client.handlers)
+        self.assertIn("message", client.handlers)
+        self.assertIn("session_end", client.handlers)
+        self.assertIn("disconnected", client.handlers)
+        self.assertIs(client.handlers["session_end"], client.handlers["disconnected"])
+
     async def test_slixmpp_upload_uses_plugin_indexing_not_dict_get(self):
         class FakeUploadPlugin:
             def __init__(self):
@@ -1438,6 +1475,21 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
             "resource": "hermes",
         })
 
+    @staticmethod
+    def _install_recovery_hooks(xmpp):
+        fatal_errors = []
+        notifications = []
+
+        def set_fatal_error(code, message, retryable=False):
+            fatal_errors.append((code, message, retryable))
+
+        async def notify_fatal_error():
+            notifications.append("notified")
+
+        xmpp._set_fatal_error = set_fatal_error
+        xmpp._notify_fatal_error = notify_fatal_error
+        return fatal_errors, notifications
+
     async def test_connect_returns_false_on_lock_conflict(self):
         cfg = self._cfg()
         xmpp = adapter.XMPPAdapter(cfg)
@@ -1497,6 +1549,99 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
             await xmpp.disconnect()
 
         release.assert_called_once_with("emma@example.org:hermes")
+        self.assertIsNone(xmpp._lock_key)
+
+    async def test_unexpected_disconnect_sets_retryable_fatal_error_notifies_once_and_releases_once(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        client = object()
+        xmpp._client = cast(Any, client)
+        xmpp._lock_key = "emma@example.org:hermes"
+        fatal_errors, notifications = self._install_recovery_hooks(xmpp)
+
+        with patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            await xmpp.on_xmpp_disconnected(ConnectionError("socket lost"), client=client)
+            await xmpp.on_xmpp_disconnected(ConnectionError("duplicate event"), client=client)
+
+        self.assertEqual(len(fatal_errors), 1)
+        self.assertEqual(fatal_errors[0][0], "connection_lost")
+        self.assertTrue(fatal_errors[0][2])
+        self.assertEqual(notifications, ["notified"])
+        release.assert_called_once_with("emma@example.org:hermes")
+        self.assertIsNone(xmpp._client)
+        self.assertIsNone(xmpp._lock_key)
+
+    async def test_explicit_disconnect_does_not_notify_reconnect_handler(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        fatal_errors, notifications = self._install_recovery_hooks(xmpp)
+
+        class Client:
+            async def disconnect(self):
+                await xmpp.on_xmpp_disconnected("operator disconnect", client=self)
+
+        client = Client()
+        xmpp._client = cast(Any, client)
+        xmpp._lock_key = "emma@example.org:hermes"
+
+        with patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            await xmpp.disconnect()
+
+        self.assertEqual(fatal_errors, [])
+        self.assertEqual(notifications, [])
+        release.assert_called_once_with("emma@example.org:hermes")
+        self.assertIsNone(xmpp._client)
+        self.assertIsNone(xmpp._lock_key)
+
+    async def test_stale_disconnect_event_does_not_disconnect_replacement_client(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        old_client = object()
+        replacement_client = object()
+        xmpp._client = cast(Any, replacement_client)
+        xmpp._lock_key = "emma@example.org:hermes"
+        fatal_errors, notifications = self._install_recovery_hooks(xmpp)
+
+        with patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            await xmpp.on_xmpp_disconnected("old client event", client=old_client)
+
+        self.assertIs(xmpp._client, replacement_client)
+        self.assertEqual(xmpp._lock_key, "emma@example.org:hermes")
+        self.assertEqual(fatal_errors, [])
+        self.assertEqual(notifications, [])
+        release.assert_not_called()
+
+    async def test_send_connection_exception_notifies_recovery_handler(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        xmpp._lock_key = "emma@example.org:hermes"
+        fatal_errors, notifications = self._install_recovery_hooks(xmpp)
+
+        class FailingClient:
+            def __init__(self):
+                self.send_calls = 0
+
+            def is_connected(self):
+                return True
+
+            async def send_message(self, *args, **kwargs):
+                self.send_calls += 1
+                raise ConnectionError("socket closed")
+
+        failing_client = FailingClient()
+        xmpp._client = cast(Any, failing_client)
+
+        with patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            result = await xmpp.send("thanos@example.org", "hello")
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        self.assertEqual(failing_client.send_calls, 1)
+        self.assertEqual(fatal_errors[0][0], "connection_lost")
+        self.assertTrue(fatal_errors[0][2])
+        self.assertEqual(notifications, ["notified"])
+        release.assert_called_once_with("emma@example.org:hermes")
+        self.assertIsNone(xmpp._client)
         self.assertIsNone(xmpp._lock_key)
 
     async def test_connect_failure_releases_lock(self):

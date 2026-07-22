@@ -94,6 +94,13 @@ def _split_csv(value: Any) -> list[str]:
     return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
+def _is_connection_loss_exception(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, OSError, asyncio.TimeoutError)):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in ("connection", "socket", "transport", "stream", "broken pipe"))
+
+
 def _reaction_choices(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
     choices = tuple(_split_csv(value))
     return choices or default
@@ -891,6 +898,9 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
                 logger.debug("XMPP plugin %s unavailable", plugin, exc_info=True)
         self.client.add_event_handler("session_start", self._on_session_start)
         self.client.add_event_handler("message", self._on_message)
+        disconnected_handler = self._on_disconnected
+        self.client.add_event_handler("session_end", disconnected_handler)
+        self.client.add_event_handler("disconnected", disconnected_handler)
 
     async def connect(self) -> bool:
         address = self.adapter.settings.connect_address()
@@ -904,6 +914,16 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
 
     async def disconnect(self) -> None:
         await self.client.disconnect()
+
+    def is_connected(self) -> bool:
+        checker = getattr(self.client, "is_connected", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                logger.debug("XMPP: slixmpp is_connected() check failed", exc_info=True)
+                return False
+        return getattr(self.client, "transport", None) is not None or getattr(self.client, "socket", None) is not None
 
     async def send_message(self, to_jid: str, text: str, message_type: str, *, thread_id: str | None = None, oob_url: str | None = None) -> str:
         message_id = f"hermes-{uuid.uuid4().hex}"
@@ -1057,6 +1077,9 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
     async def _on_message(self, msg: Any) -> None:
         await self.adapter.on_xmpp_message(msg)
 
+    async def _on_disconnected(self, event: Any = None) -> None:
+        await self.adapter.on_xmpp_disconnected(event, client=self)
+
 
 def _msg_get(msg: Any, key: str, default: Any = "") -> Any:
     try:
@@ -1127,6 +1150,7 @@ class XMPPAdapter(BasePlatformAdapter):
         self._status_message_ids: dict[tuple[str, str], str] = {}
         self._disabled_status_keys: set[tuple[str, str]] = set()
         self._lock_key: str | None = None
+        self._operator_disconnect = False
 
     @property
     def name(self) -> str:
@@ -1169,12 +1193,43 @@ class XMPPAdapter(BasePlatformAdapter):
         return ok
 
     async def disconnect(self) -> None:
+        self._operator_disconnect = True
+        try:
+            client = self._client
+            self._mark_disconnected()
+            self._client = None
+            _release_xmpp_identity_lock(self._lock_key)
+            self._lock_key = None
+            if client:
+                await client.disconnect()
+        finally:
+            self._operator_disconnect = False
+
+    def _client_is_connected(self) -> bool:
+        if not self._client:
+            return False
+        checker = getattr(self._client, "is_connected", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker())
+        except Exception:
+            logger.debug("XMPP: client connection check failed", exc_info=True)
+            return False
+
+    async def on_xmpp_disconnected(self, reason: Any = None, *, client: _SlixmppClient | None = None) -> None:
+        active_client = self._client
+        if self._operator_disconnect or (client is not None and client is not active_client):
+            return
+        if active_client is None and self._lock_key is None:
+            return
+        logger.warning("XMPP: disconnected from %s: %s", self.settings.jid, reason)
         self._mark_disconnected()
-        if self._client:
-            await self._client.disconnect()
         self._client = None
         _release_xmpp_identity_lock(self._lock_key)
         self._lock_key = None
+        self._set_fatal_error("connection_lost", f"XMPP connection lost: {reason}", retryable=True)
+        await self._notify_fatal_error()
 
     async def send(
         self,
@@ -1183,14 +1238,17 @@ class XMPPAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._client:
+        client = self._client
+        if not self._client_is_connected():
+            await self.on_xmpp_disconnected("send attempted while disconnected", client=client)
             return SendResult(success=False, error="XMPP adapter is not connected", retryable=True)
+        assert client is not None
         target = _normalize_target(chat_id)
         message_type = "groupchat" if (metadata or {}).get("chat_type") == "group" or _is_group_jid(target) else "chat"
         try:
             message_ids: list[str] = []
             for index, chunk in enumerate(split_text_for_xmpp(content, self.settings.text_chunk_limit)):
-                message_id = await self._client.send_message(
+                message_id = await client.send_message(
                     target,
                     chunk,
                     message_type,
@@ -1204,6 +1262,8 @@ class XMPPAdapter(BasePlatformAdapter):
                 continuation_message_ids=tuple(message_ids[:-1]),
             )
         except Exception as exc:
+            if _is_connection_loss_exception(exc):
+                await self.on_xmpp_disconnected(exc, client=client)
             return SendResult(success=False, error=str(exc), retryable=True)
 
     def _message_text_changed(self, message_id: str, content: str) -> bool:
@@ -1228,9 +1288,11 @@ class XMPPAdapter(BasePlatformAdapter):
             return False
         if policy == "force":
             return True
-        if not self._client:
+        if not self._client_is_connected():
             return False
-        checker = getattr(self._client, "supports_message_correction", None)
+        client = self._client
+        assert client is not None
+        checker = getattr(client, "supports_message_correction", None)
         if not callable(checker):
             return False
         try:
@@ -1308,7 +1370,9 @@ class XMPPAdapter(BasePlatformAdapter):
         extra fallback messages here; the gateway can decide whether to degrade
         to per-line progress, and this adapter avoids doubling/spamming updates.
         """
-        if not self._client:
+        client = self._client
+        if not self._client_is_connected():
+            await self.on_xmpp_disconnected("edit attempted while disconnected", client=client)
             return SendResult(success=False, error="XMPP adapter is not connected", retryable=True)
         if not self._message_text_changed(message_id, content):
             return SendResult(success=True, message_id=message_id)
@@ -1320,7 +1384,8 @@ class XMPPAdapter(BasePlatformAdapter):
                 error="XMPP message editing is not supported for this recipient/client",
                 retryable=False,
             )
-        edit = getattr(self._client, "edit_message", None)
+        assert client is not None
+        edit = getattr(client, "edit_message", None)
         if edit is None:
             return SendResult(
                 success=False,
@@ -1333,8 +1398,13 @@ class XMPPAdapter(BasePlatformAdapter):
             self._sent_text_by_message_id[message_id] = str(content or "")
             return SendResult(success=True, message_id=message_id)
         except RuntimeError as exc:
+            if _is_connection_loss_exception(exc):
+                await self.on_xmpp_disconnected(exc, client=client)
+                return SendResult(success=False, message_id=message_id, error=str(exc), retryable=True)
             return SendResult(success=False, message_id=message_id, error=str(exc), retryable=False)
         except Exception as exc:
+            if _is_connection_loss_exception(exc):
+                await self.on_xmpp_disconnected(exc, client=client)
             return SendResult(success=False, error=str(exc), retryable=True)
 
     def _message_type_for_target(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> tuple[str, str]:
@@ -1352,19 +1422,24 @@ class XMPPAdapter(BasePlatformAdapter):
         metadata: Optional[dict[str, Any]] = None,
         content_type: Optional[str] = None,
     ) -> SendResult:
-        if not self._client:
+        client = self._client
+        if not self._client_is_connected():
+            await self.on_xmpp_disconnected("media send attempted while disconnected", client=client)
             return SendResult(success=False, error="XMPP adapter is not connected", retryable=True)
+        assert client is not None
         path = Path(file_path).expanduser()
         if not path.is_file():
             return SendResult(success=False, error=f"Media file not found: {file_path}", retryable=False)
         detected_type = content_type or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         target, message_type = self._message_type_for_target(chat_id, metadata)
         try:
-            url = await self._client.upload_file(str(path), detected_type)
+            url = await client.upload_file(str(path), detected_type)
             text = f"{caption}\n{url}" if caption else url
-            message_id = await self._client.send_message(target, text, message_type, thread_id=reply_to, oob_url=url)
+            message_id = await client.send_message(target, text, message_type, thread_id=reply_to, oob_url=url)
             return SendResult(success=True, message_id=message_id, raw_response={"url": url, "content_type": detected_type})
         except Exception as exc:
+            if _is_connection_loss_exception(exc):
+                await self.on_xmpp_disconnected(exc, client=client)
             return SendResult(success=False, error=str(exc), retryable=_media_upload_retryable(exc))
 
     async def send_image_file(
@@ -1432,23 +1507,47 @@ class XMPPAdapter(BasePlatformAdapter):
         because chat state notifications are client/UI state rather than durable
         messages.
         """
-        if not self.settings.send_chat_states or not self._client:
+        if not self.settings.send_chat_states:
+            return
+        client = self._client
+        if not self._client_is_connected():
+            if client is not None:
+                await self.on_xmpp_disconnected("chat-state send attempted while disconnected", client=client)
             return
         target = self._chat_state_target(chat_id)
         if target is None:
             return
         to_jid, message_type = target
-        await self._client.send_chat_state(to_jid, "composing", message_type)
+        assert client is not None
+        try:
+            await client.send_chat_state(to_jid, "composing", message_type)
+        except Exception as exc:
+            if _is_connection_loss_exception(exc):
+                await self.on_xmpp_disconnected(exc, client=client)
+            else:
+                raise
 
     async def stop_typing(self, chat_id: str) -> None:
         """Send XEP-0085 ``active`` to clear the composing indicator."""
-        if not self.settings.send_chat_states or not self._client:
+        if not self.settings.send_chat_states:
+            return
+        client = self._client
+        if not self._client_is_connected():
+            if client is not None:
+                await self.on_xmpp_disconnected("chat-state send attempted while disconnected", client=client)
             return
         target = self._chat_state_target(chat_id)
         if target is None:
             return
         to_jid, message_type = target
-        await self._client.send_chat_state(to_jid, "active", message_type)
+        assert client is not None
+        try:
+            await client.send_chat_state(to_jid, "active", message_type)
+        except Exception as exc:
+            if _is_connection_loss_exception(exc):
+                await self.on_xmpp_disconnected(exc, client=client)
+            else:
+                raise
 
     def _reaction_target_for_event(self, event: MessageEvent) -> XmppReactionTarget | None:
         if not self.settings.reactions_enabled:
@@ -1479,21 +1578,27 @@ class XMPPAdapter(BasePlatformAdapter):
         return XmppReactionTarget(target, message_id, "chat")
 
     async def _send_reactions_to_target(self, target: XmppReactionTarget, reactions: Any) -> bool:
-        if not self._client:
+        client = self._client
+        if not self._client_is_connected():
+            if client is not None:
+                await self.on_xmpp_disconnected("reaction send attempted while disconnected", client=client)
             return False
         normalized = tuple(_split_csv(reactions))
         if not normalized:
             return False
+        assert client is not None
         try:
             return bool(
-                await self._client.send_reactions(
+                await client.send_reactions(
                     target.to_jid,
                     target.message_id,
                     normalized,
                     target.message_type,
                 )
             )
-        except Exception:
+        except Exception as exc:
+            if _is_connection_loss_exception(exc):
+                await self.on_xmpp_disconnected(exc, client=client)
             logger.debug("XMPP: failed sending reaction for %s", target.message_id, exc_info=True)
             return False
 
@@ -1566,17 +1671,20 @@ class XMPPAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _send_receipt_actions(self, actions: list[XmppReceiptAction]) -> None:
-        if not self._client:
+        client = self._client
+        if not client:
             return
         for action in actions:
             try:
                 if action.kind == XmppReceiptKind.DELIVERY_RECEIPT:
-                    await self._client.send_delivery_receipt(action.to_jid, action.message_id, action.message_type)
+                    await client.send_delivery_receipt(action.to_jid, action.message_id, action.message_type)
                 elif action.kind == XmppReceiptKind.RECEIVED_MARKER:
-                    await self._client.send_chat_marker(action.to_jid, action.message_id, "received", action.message_type)
+                    await client.send_chat_marker(action.to_jid, action.message_id, "received", action.message_type)
                 elif action.kind == XmppReceiptKind.DISPLAYED_MARKER:
-                    await self._client.send_chat_marker(action.to_jid, action.message_id, "displayed", action.message_type)
-            except Exception:
+                    await client.send_chat_marker(action.to_jid, action.message_id, "displayed", action.message_type)
+            except Exception as exc:
+                if _is_connection_loss_exception(exc):
+                    await self.on_xmpp_disconnected(exc, client=client)
                 logger.debug("XMPP: failed sending %s for %s", action.kind.value, action.message_id, exc_info=True)
 
     def _authorized_direct_message(self, bare_sender_jid: str) -> bool:
