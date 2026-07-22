@@ -140,3 +140,11 @@ optional_env:
     description: "When progress delivery is edit: known (probe recipient support, default), force (always send XEP-0308), or disabled"
     prompt: "Editable progress policy"
     password: false
+  - name: XMPP_TOOL_PROGRESS_BUBBLE_LIMIT
+    description: "Max tool-progress/status updates via send_or_update_status before that chat/status key is disabled; default 30"
+    prompt: "Tool progress bubble limit"
+    password: false
+  - name: XMPP_ANONYMOUS_MUC_POLICY
+    description: "Anonymous MUC nick handling: mention_only (default), allow, or deny"
+    prompt: "Anonymous MUC policy"
+    password: false
