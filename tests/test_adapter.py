@@ -339,6 +339,22 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.thread_id, "thread-42")
 
+    def test_parse_preserves_opaque_thread_id_exactly(self):
+        settings = self._settings()
+        parsed = adapter.parse_xmpp_message(
+            FakeMessage(
+                body="hello",
+                **{"from": "thanos@example.org/dino"},
+                type="chat",
+                id="m-thread",
+                thread=" thread-42 ",
+            ),
+            settings,
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.thread_id, " thread-42 ")
+
     def test_unauthorized_messages_do_not_get_receipt_actions(self):
         settings = self._settings()
         msg = FakeMessage(
@@ -484,19 +500,18 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         typing_task = asyncio.create_task(xmpp.send_typing(
             "thanos@example.org",
-            metadata={"thread_id": "thread-42"},
+            metadata={"thread_id": " thread-42 "},
         ))
         await xmpp.on_processing_start(types.SimpleNamespace(
-            source=types.SimpleNamespace(thread_id="thread-42"),
+            source=types.SimpleNamespace(thread_id=" thread-42 "),
         ))
         await typing_task
         await xmpp.stop_typing("thanos@example.org")
         await xmpp.stop_typing("thanos@example.org")
 
         self.assertEqual(fake_client.calls, [
-            ("composing", "thanos@example.org/dino", "chat", "thread-42"),
-            ("active", "thanos@example.org/dino", "chat", "thread-42"),
-            ("active", "thanos@example.org/dino", "chat", "thread-42"),
+            ("composing", "thanos@example.org/dino", "chat", " thread-42 "),
+            ("active", "thanos@example.org/dino", "chat", " thread-42 "),
         ])
 
     async def test_concurrent_thread_chat_states_keep_task_ownership(self):
@@ -543,11 +558,118 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertCountEqual(fake_client.calls, [
             ("composing", "thread-a"),
             ("active", "thread-a"),
-            ("active", "thread-a"),
             ("composing", "thread-b"),
             ("active", "thread-b"),
-            ("active", "thread-b"),
         ])
+
+    async def test_body_reply_active_state_suppresses_redundant_stop(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "allowed_users": ["thanos@example.org"],
+            "reactions_enabled": False,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.states = []
+
+            async def send_chat_state(
+                self,
+                to_jid,
+                state,
+                message_type="chat",
+                *,
+                thread_id=None,
+            ):
+                self.states.append((state, thread_id))
+
+            async def send_message(
+                self,
+                to_jid,
+                text,
+                message_type,
+                *,
+                thread_id=None,
+                oob_url=None,
+            ):
+                return "reply-1"
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+
+        await xmpp.send_typing(
+            "thanos@example.org",
+            metadata={"thread_id": "thread-42"},
+        )
+        await xmpp.send(
+            "thanos@example.org",
+            "done",
+            metadata={"thread_id": "thread-42"},
+        )
+        await xmpp.stop_typing("thanos@example.org")
+
+        self.assertEqual(fake_client.states, [("composing", "thread-42")])
+
+    async def test_correction_active_state_suppresses_redundant_stop(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "allowed_users": ["thanos@example.org"],
+            "progress_delivery": "edit",
+            "reactions_enabled": False,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.states = []
+
+            async def send_chat_state(
+                self,
+                to_jid,
+                state,
+                message_type="chat",
+                *,
+                thread_id=None,
+            ):
+                self.states.append((state, thread_id))
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return True
+
+            async def edit_message(
+                self,
+                to_jid,
+                message_id,
+                text,
+                message_type,
+                *,
+                thread_id=None,
+            ):
+                return message_id
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        xmpp._sent_text_by_message_id["status-1"] = "old"
+
+        await xmpp.send_typing(
+            "thanos@example.org",
+            metadata={"thread_id": "thread-42"},
+        )
+        result = await xmpp.edit_message(
+            "thanos@example.org",
+            "status-1",
+            "new",
+            metadata={"thread_id": "thread-42"},
+        )
+        await xmpp.stop_typing("thanos@example.org")
+
+        self.assertTrue(result.success)
+        self.assertEqual(fake_client.states, [("composing", "thread-42")])
 
     async def test_adapter_puts_incoming_thread_on_message_source(self):
         cfg = types.SimpleNamespace(extra={
@@ -687,6 +809,9 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             def __getitem__(self, key):
                 return self.values.setdefault(key, {})
 
+            def __setitem__(self, key, value):
+                self.values[key] = value
+
             def enable(self, key):
                 if key == "store":
                     self.store_enabled = True
@@ -716,7 +841,13 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         thin = cast(Any, object.__new__(adapter._SlixmppClient))
         thin.client = FakeClient({"xep_0444": reactions_plugin})
 
-        sent = await thin.send_reactions("thanos@example.org", "m1", ("👀",), "chat")
+        sent = await thin.send_reactions(
+            "thanos@example.org",
+            "m1",
+            ("👀",),
+            "chat",
+            thread_id=" reaction-thread ",
+        )
         missing_thin = cast(Any, object.__new__(adapter._SlixmppClient))
         missing_thin.client = FakeClient({})
         missing = await missing_thin.send_reactions("thanos@example.org", "m1", ("👀",), "chat")
@@ -725,6 +856,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(missing)
         self.assertEqual(reactions_plugin.calls[0][1:], ("m1", ("👀",)))
         self.assertEqual(thin.client.messages[0].values["reactions"], {"id": "m1", "values": ("👀",)})
+        self.assertEqual(thin.client.messages[0].values["thread"], " reaction-thread ")
         self.assertTrue(thin.client.messages[0].store_enabled)
         self.assertTrue(thin.client.messages[0].sent)
 
@@ -853,7 +985,13 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         thin.client = FakeClient()
         thin.adapter = types.SimpleNamespace(settings=types.SimpleNamespace(send_chat_states=True))
 
-        replacement_id = await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
+        replacement_id = await thin.edit_message(
+            "thanos@example.org",
+            "msg-1",
+            "📖 read_file...",
+            "chat",
+            thread_id=" correction-thread ",
+        )
 
         self.assertTrue(replacement_id.startswith("hermes-"))
         self.assertEqual(len(thin.client.messages), 1)
@@ -862,6 +1000,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msg.values["body"], "📖 read_file...")
         self.assertEqual(msg.values["replace"], {"id": "msg-1"})
         self.assertEqual(msg.values["chat_state"], "active")
+        self.assertEqual(msg.values["thread"], " correction-thread ")
         self.assertEqual(thin.client.plugin["xep_0308"].calls, [(msg, "msg-1")])
 
     async def test_slixmpp_client_edit_message_raises_when_xep_0308_missing(self):
@@ -900,8 +1039,8 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
                 self.messages.append((to_jid, text, message_type, thread_id, oob_url))
                 return f"msg-{len(self.messages)}"
 
-            async def edit_message(self, to_jid, message_id, text, message_type):
-                self.edits.append((to_jid, message_id, text, message_type))
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
+                self.edits.append((to_jid, message_id, text, message_type, thread_id))
                 return f"edit-{len(self.edits)}"
 
             async def supports_message_correction(self, to_jid, message_type):
@@ -910,28 +1049,33 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         fake_client = FakeClient()
         xmpp._client = cast(Any, fake_client)
 
-        first = await xmpp.send("thanos@example.org", "🔍 search_files...", metadata={"chat_type": "dm"})
+        thread_metadata = {"chat_type": "dm", "thread_id": " progress-thread "}
+        first = await xmpp.send(
+            "thanos@example.org",
+            "🔍 search_files...",
+            metadata=thread_metadata,
+        )
         edit = await xmpp.edit_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
-            metadata={"chat_type": "dm"},
+            metadata=thread_metadata,
         )
         duplicate = await xmpp.edit_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
-            metadata={"chat_type": "dm"},
+            metadata=thread_metadata,
         )
 
         self.assertTrue(edit.success)
         self.assertEqual(edit.message_id, first.message_id)
         self.assertTrue(duplicate.success)
         self.assertEqual(fake_client.messages, [
-            ("thanos@example.org", "🔍 search_files...", "chat", None, None),
+            ("thanos@example.org", "🔍 search_files...", "chat", " progress-thread ", None),
         ])
         self.assertEqual(fake_client.edits, [
-            ("thanos@example.org", cast(str, first.message_id), "🔍 search_files...\n📖 read_file...", "chat"),
+            ("thanos@example.org", cast(str, first.message_id), "🔍 search_files...\n📖 read_file...", "chat", " progress-thread "),
         ])
 
     async def test_tool_progress_edit_unsupported_fails_without_sending_extra_bubbles(self):
@@ -954,7 +1098,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             async def supports_message_correction(self, to_jid, message_type):
                 return False
 
-            async def edit_message(self, to_jid, message_id, text, message_type):
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
                 raise AssertionError("unsupported clients must be gated before sending correction stanzas")
 
         fake_client = FakeClient()
@@ -992,7 +1136,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             async def supports_message_correction(self, to_jid, message_type):
                 return True
 
-            async def edit_message(self, to_jid, message_id, text, message_type):
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
                 self.edits.append((to_jid, message_id, text, message_type))
                 return f"edit-{len(self.edits)}"
 
@@ -1028,7 +1172,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             async def supports_message_correction(self, to_jid, message_type):
                 return True
 
-            async def edit_message(self, to_jid, message_id, text, message_type):
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
                 self.edits.append((to_jid, message_id, text, message_type))
                 return f"edit-{len(self.edits)}"
 
@@ -1050,6 +1194,55 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("thanos@example.org", "msg-1", "Still working…", "chat"),
         ])
 
+    async def test_status_bubbles_are_isolated_by_xmpp_thread(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+                self.edits = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((text, thread_id))
+                return f"msg-{len(self.messages)}"
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return True
+
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
+                self.edits.append((message_id, text))
+                return message_id
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send_or_update_status(
+            "thanos@example.org",
+            "lifecycle",
+            "thread A",
+            metadata={"thread_id": "thread-a"},
+        )
+        second = await xmpp.send_or_update_status(
+            "thanos@example.org",
+            "lifecycle",
+            "thread B",
+            metadata={"thread_id": "thread-b"},
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(fake_client.messages, [
+            ("thread A", "thread-a"),
+            ("thread B", "thread-b"),
+        ])
+        self.assertEqual(fake_client.edits, [])
+
     async def test_send_or_update_status_edit_unsupported_falls_back_to_visible_messages(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
@@ -1070,7 +1263,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             async def supports_message_correction(self, to_jid, message_type):
                 return False
 
-            async def edit_message(self, to_jid, message_id, text, message_type):
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
                 raise AssertionError("unsupported clients must not receive correction stanzas")
 
         fake_client = FakeClient()
@@ -1137,7 +1330,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             async def supports_message_correction(self, to_jid, message_type):
                 return True
 
-            async def edit_message(self, to_jid, message_id, text, message_type):
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
                 self.edits.append((to_jid, message_id, text, message_type))
                 return f"edit-{len(self.edits)}"
 
@@ -1150,13 +1343,53 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(first.success)
         self.assertTrue(second.success)
-        self.assertEqual(xmpp._tool_progress_bubbles_sent, 2)
-        self.assertIn(("thanos@example.org", "lifecycle"), xmpp._disabled_status_keys)
+        self.assertEqual(xmpp._tool_progress_bubbles_sent[("thanos@example.org", None)], 2)
+        self.assertIn(("thanos@example.org", None, "lifecycle"), xmpp._disabled_status_keys)
         self.assertFalse(third.success)
         self.assertFalse(third.retryable)
         self.assertIn("disabled", cast(str, third.error).lower())
         self.assertEqual(len(fake_client.messages), 1)
         self.assertEqual(len(fake_client.edits), 1)
+
+    async def test_tool_progress_limit_is_independent_per_thread(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "tool_progress_bubble_limit": 1,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((text, thread_id))
+                return f"msg-{len(self.messages)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        first = await xmpp.send_or_update_status(
+            "thanos@example.org",
+            "lifecycle",
+            "thread A",
+            metadata={"thread_id": "thread-a"},
+        )
+        second = await xmpp.send_or_update_status(
+            "thanos@example.org",
+            "lifecycle",
+            "thread B",
+            metadata={"thread_id": "thread-b"},
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(fake_client.messages, [
+            ("thread A", "thread-a"),
+            ("thread B", "thread-b"),
+        ])
 
     async def test_tool_progress_limit_zero_disables_first_status_update(self):
         cfg = types.SimpleNamespace(extra={
@@ -1184,10 +1417,10 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.retryable)
         self.assertIn("disabled", cast(str, result.error).lower())
         self.assertEqual(fake_client.messages, [])
-        self.assertIn(("thanos@example.org", "lifecycle"), xmpp._disabled_status_keys)
-        self.assertEqual(xmpp._tool_progress_bubbles_sent, 0)
+        self.assertIn(("thanos@example.org", None, "lifecycle"), xmpp._disabled_status_keys)
+        self.assertEqual(xmpp._tool_progress_bubbles_sent.get(("thanos@example.org", None), 0), 0)
 
-    async def test_tool_progress_limit_is_atomic_across_concurrent_updates(self):
+    async def test_tool_progress_limit_is_atomic_within_one_lane(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
             "server": "chat.example.org",
@@ -1217,7 +1450,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
         await started.wait()
         second_task = loop.create_task(
-            xmpp.send_or_update_status("b@example.org", "two", "second")
+            xmpp.send_or_update_status("a@example.org", "two", "second")
         )
         # Give the second caller a chance to race the unlocked path if present.
         await __import__("asyncio").sleep(0)
@@ -1230,7 +1463,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(failures), 1)
         self.assertFalse(failures[0].retryable)
         self.assertIn("disabled", cast(str, failures[0].error).lower())
-        self.assertEqual(xmpp._tool_progress_bubbles_sent, 1)
+        self.assertEqual(xmpp._tool_progress_bubbles_sent[("a@example.org", None)], 1)
         self.assertEqual(len(fake_client.messages), 1)
         self.assertEqual(len(xmpp._disabled_status_keys), 2)
 
@@ -1258,15 +1491,15 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "thanos@example.org",
             "hello brave little world",
             reply_to="orig-msg",
-            metadata={"thread_id": "thread-42"},
+            metadata={"thread_id": " thread-42 "},
         )
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "msg-2")
         self.assertEqual(result.continuation_message_ids, ("msg-1",))
         self.assertEqual(fake_client.messages, [
-            ("thanos@example.org", "hello brave", "chat", "thread-42", None),
-            ("thanos@example.org", "little world", "chat", "thread-42", None),
+            ("thanos@example.org", "hello brave", "chat", " thread-42 ", None),
+            ("thanos@example.org", "little world", "chat", " thread-42 ", None),
         ])
 
     async def test_media_upload_deterministic_failures_are_not_retryable(self):
@@ -1298,6 +1531,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.uploads = []
                 self.messages = []
+                self.states = []
 
             async def upload_file(self, file_path, content_type=None):
                 self.uploads.append((file_path, content_type))
@@ -1307,20 +1541,42 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
                 self.messages.append((to_jid, text, message_type, thread_id, oob_url))
                 return "msg-image"
 
+            async def send_chat_state(
+                self,
+                to_jid,
+                state,
+                message_type="chat",
+                *,
+                thread_id=None,
+            ):
+                self.states.append((state, thread_id))
+
         image_path = "/tmp/hermes-test-image.png"
         Path(image_path).write_bytes(b"fake png")
         fake_client = FakeClient()
         xmpp._client = fake_client
 
-        result = await xmpp.send_image_file("thanos@example.org", image_path, caption="A tiny test")
+        await xmpp.send_typing(
+            "thanos@example.org",
+            metadata={"thread_id": " media-thread "},
+        )
+        result = await xmpp.send_image_file(
+            "thanos@example.org",
+            image_path,
+            caption="A tiny test",
+            reply_to="reply-anchor",
+            metadata={"thread_id": " media-thread "},
+        )
+        await xmpp.stop_typing("thanos@example.org")
 
         self.assertTrue(result.success)
         self.assertEqual(fake_client.uploads, [(image_path, "image/png")])
         self.assertEqual(fake_client.messages, [
-            ("thanos@example.org", "A tiny test\nhttps://upload.example.org/image.png", "chat", None, "https://upload.example.org/image.png")
+            ("thanos@example.org", "A tiny test\nhttps://upload.example.org/image.png", "chat", " media-thread ", "https://upload.example.org/image.png")
         ])
+        self.assertEqual(fake_client.states, [("composing", " media-thread ")])
 
-    async def test_adapter_chunks_oversized_text_and_reports_continuations(self):
+    async def test_reply_anchor_does_not_create_an_xmpp_thread(self):
         cfg = types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret", "text_chunk_limit": 6})
         xmpp = adapter.XMPPAdapter(cfg)
 
@@ -1341,7 +1597,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.message_id, "msg-3")
         self.assertEqual(result.continuation_message_ids, ("msg-1", "msg-2"))
         self.assertEqual([call[1] for call in fake_client.messages], ["hello", "there", "friend"])
-        self.assertEqual([call[3] for call in fake_client.messages], ["root", "root", "root"])
+        self.assertEqual([call[3] for call in fake_client.messages], [None, None, None])
 
     def test_declared_media_kinds_tracks_future_fail_closed_gateway_api(self):
         old_media_kind = adapter.MediaKind
@@ -1359,6 +1615,50 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         finally:
             adapter.MediaKind = old_media_kind
 
+    async def test_standalone_thread_uses_thread_metadata_not_reply_anchor(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        })
+        sent = []
+
+        class FakeAdapter:
+            def __init__(self, pconfig):
+                pass
+
+            async def connect(self):
+                return True
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                sent.append((chat_id, content, reply_to, metadata))
+                return adapter.SendResult(success=True, message_id="message-1")
+
+            async def disconnect(self):
+                return None
+
+        old = adapter.XMPPAdapter
+        try:
+            adapter.XMPPAdapter = FakeAdapter
+            result = await adapter._standalone_send(
+                cfg,
+                "thanos@example.org",
+                "hello",
+                thread_id=" standalone-thread ",
+            )
+        finally:
+            adapter.XMPPAdapter = old
+
+        self.assertEqual(result, {"success": True, "message_id": "message-1"})
+        self.assertEqual(sent, [
+            (
+                "thanos@example.org",
+                "hello",
+                None,
+                {"thread_id": " standalone-thread "},
+            ),
+        ])
+
     async def test_standalone_sender_routes_video_to_send_video(self):
         cfg = types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"})
 
@@ -1369,7 +1669,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             async def connect(self):
                 return True
 
-            async def send_video(self, chat_id, video_path, caption=None, reply_to=None):
+            async def send_video(self, chat_id, video_path, caption=None, reply_to=None, metadata=None):
                 self.sent.append((chat_id, video_path, caption, reply_to))
                 return adapter.SendResult(success=True, message_id="video-msg")
 
@@ -1398,7 +1698,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             async def connect(self):
                 return True
 
-            async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None):
+            async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None):
                 self.sent.append((chat_id, image_path, caption, reply_to))
                 return adapter.SendResult(success=True, message_id="media-msg")
 
@@ -1466,7 +1766,15 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+            async def send_reactions(
+                self,
+                to_jid,
+                message_id,
+                reactions,
+                message_type="chat",
+                *,
+                thread_id=None,
+            ):
                 self.calls.append((to_jid, message_id, tuple(reactions), message_type))
                 return True
 
@@ -1493,20 +1801,42 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
-                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+            async def send_reactions(
+                self,
+                to_jid,
+                message_id,
+                reactions,
+                message_type="chat",
+                *,
+                thread_id=None,
+            ):
+                self.calls.append(
+                    (to_jid, message_id, tuple(reactions), message_type, thread_id)
+                )
                 return True
 
         fake_client = FakeClient()
         xmpp._client = fake_client
-        msg = FakeMessage(body="hello", **{"from": "thanos@example.org/dino"}, type="chat", id="dm-playful")
+        msg = FakeMessage(
+            body="hello",
+            **{"from": "thanos@example.org/dino"},
+            type="chat",
+            id="dm-playful",
+            thread=" reaction-thread ",
+        )
         event = self._event(xmpp, msg)
 
         sent = await xmpp.react_to_event(event, ["❤️", "😂"])
 
         self.assertTrue(sent)
         self.assertEqual(fake_client.calls, [
-            ("thanos@example.org/dino", "dm-playful", ("❤️", "😂"), "chat"),
+            (
+                "thanos@example.org/dino",
+                "dm-playful",
+                ("❤️", "😂"),
+                "chat",
+                " reaction-thread ",
+            ),
         ])
 
     async def test_arbitrary_reaction_helper_keeps_auth_gate(self):
@@ -1516,7 +1846,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat", *, thread_id=None):
                 self.calls.append((to_jid, message_id, tuple(reactions), message_type))
                 return True
 
@@ -1537,7 +1867,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat", *, thread_id=None):
                 self.calls.append((to_jid, message_id, tuple(reactions), message_type))
                 return True
 
@@ -1561,7 +1891,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat", *, thread_id=None):
                 self.calls.append((to_jid, message_id, tuple(reactions), message_type))
                 return True
 
@@ -1582,7 +1912,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat", *, thread_id=None):
                 self.calls.append((to_jid, message_id, tuple(reactions), message_type))
                 return True
 
@@ -1619,7 +1949,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat", *, thread_id=None):
                 self.calls.append((to_jid, message_id, tuple(reactions), message_type))
                 return True
 
@@ -1638,7 +1968,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
         xmpp = self._xmpp()
 
         class FakeClient:
-            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat"):
+            async def send_reactions(self, to_jid, message_id, reactions, message_type="chat", *, thread_id=None):
                 return False
 
         xmpp._client = FakeClient()
@@ -1854,12 +2184,14 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         cfg = self._cfg()
         xmpp = adapter.XMPPAdapter(cfg)
         xmpp._lock_key = "emma@example.org:hermes"
+        xmpp._chat_states[("thanos@example.org", "chat", "thread-1")] = "active"
 
         with patch.object(adapter, "_release_xmpp_identity_lock") as release:
             await xmpp.disconnect()
 
         release.assert_called_once_with("emma@example.org:hermes")
         self.assertIsNone(xmpp._lock_key)
+        self.assertEqual(xmpp._chat_states, {})
 
     async def test_unexpected_disconnect_sets_retryable_fatal_error_notifies_once_and_releases_once(self):
         cfg = self._cfg()
@@ -1867,6 +2199,7 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         client = object()
         xmpp._client = cast(Any, client)
         xmpp._lock_key = "emma@example.org:hermes"
+        xmpp._chat_states[("thanos@example.org", "chat", "thread-1")] = "active"
         fatal_errors, notifications = self._install_recovery_hooks(xmpp)
 
         with patch.object(adapter, "_release_xmpp_identity_lock") as release:
@@ -1880,6 +2213,7 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         release.assert_called_once_with("emma@example.org:hermes")
         self.assertIsNone(xmpp._client)
         self.assertIsNone(xmpp._lock_key)
+        self.assertEqual(xmpp._chat_states, {})
 
     async def test_fallback_base_notify_fatal_error_invokes_handler_without_monkeypatch(self):
         """Unit-test BasePlatformAdapter stub must expose Hermes' notify hook."""

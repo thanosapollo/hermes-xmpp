@@ -154,6 +154,14 @@ def _normalize_target(target: str) -> str:
     return text.strip()
 
 
+def _optional_thread_id(value: Any) -> str | None:
+    """Return VALUE as an exact non-empty XEP-0201 thread ID."""
+    if value is None:
+        return None
+    thread_id = str(value)
+    return thread_id or None
+
+
 def _is_group_jid(jid: str) -> bool:
     bare = _bare_jid(_normalize_target(jid))
     if bare.startswith("room:"):
@@ -564,6 +572,7 @@ class XmppReactionTarget:
     to_jid: str
     message_id: str
     message_type: str
+    thread_id: str | None = None
 
 
 def _stanza_bool(msg: Any, key: str, namespace: str, name: str) -> bool:
@@ -667,7 +676,7 @@ def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | 
     from_jid = _bare_jid(raw_from)
     msg_type = str(_msg_get(msg, "type", "chat") or "chat")
     message_id = _extract_message_id(msg)
-    thread_id = str(_msg_get(msg, "thread", "") or "").strip()
+    thread_id = str(_msg_get(msg, "thread", "") or "")
     wants_delivery_receipt = _message_requests_delivery_receipt(msg)
     wants_chat_marker = _message_requests_chat_marker(msg)
     is_marker_or_receipt = _message_has_marker_or_receipt(msg)
@@ -947,9 +956,7 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         msg = self.client.make_message(mto=to_jid, mbody=text, mtype=message_type)
         msg["id"] = message_id
         if thread_id:
-            # XEP-0201: carry the conversation thread so clients can group
-            # Hermes' replies with the originating message. Without this the
-            # reply_to/thread_id Hermes forwards is silently dropped.
+            # XEP-0201 thread IDs are opaque and must round-trip unchanged.
             msg["thread"] = thread_id
         if self.adapter.settings.send_chat_states and message_type == "chat":
             # XEP-0085: advertise support and mark the conversation active on
@@ -964,7 +971,15 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         msg.send()
         return message_id
 
-    async def edit_message(self, to_jid: str, message_id: str, text: str, message_type: str) -> str:
+    async def edit_message(
+        self,
+        to_jid: str,
+        message_id: str,
+        text: str,
+        message_type: str,
+        *,
+        thread_id: str | None = None,
+    ) -> str:
         try:
             correction_plugin = self.client.plugin["xep_0308"]
         except Exception as exc:
@@ -972,6 +987,8 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         replacement_id = f"hermes-{uuid.uuid4().hex}"
         msg = self.client.make_message(mto=to_jid, mbody=text, mtype=message_type)
         msg["id"] = replacement_id
+        if thread_id:
+            msg["thread"] = thread_id
         if self.adapter.settings.send_chat_states and message_type == "chat":
             msg["chat_state"] = "active"
         set_correction = getattr(correction_plugin, "set_correction", None)
@@ -1075,12 +1092,16 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         message_id: str,
         reactions: tuple[str, ...] | list[str],
         message_type: str = "chat",
+        *,
+        thread_id: str | None = None,
     ) -> bool:
         try:
             reactions_plugin = self.client.plugin["xep_0444"]
         except Exception:
             return False
         msg = self.client.make_message(mto=to_jid, mtype=message_type)
+        if thread_id:
+            msg["thread"] = thread_id
         reactions_plugin.set_reactions(msg, message_id, reactions)
         try:
             msg.enable("store")
@@ -1175,10 +1196,12 @@ class XMPPAdapter(BasePlatformAdapter):
             "hermes_xmpp_chat_state_thread",
             default=None,
         )
+        self._chat_states: dict[tuple[str, str, str | None], str] = {}
+        self._chat_state_lock = asyncio.Lock()
         self._sent_text_by_message_id: dict[str, str] = {}
-        self._tool_progress_bubbles_sent = 0
-        self._status_message_ids: dict[tuple[str, str], str] = {}
-        self._disabled_status_keys: set[tuple[str, str]] = set()
+        self._tool_progress_bubbles_sent: dict[tuple[str, str | None], int] = {}
+        self._status_message_ids: dict[tuple[str, str | None, str], str] = {}
+        self._disabled_status_keys: set[tuple[str, str | None, str]] = set()
         self._status_progress_lock = asyncio.Lock()
         self._lock_key: str | None = None
         self._operator_disconnect = False
@@ -1231,6 +1254,7 @@ class XMPPAdapter(BasePlatformAdapter):
             self._client = None
             _release_xmpp_identity_lock(self._lock_key)
             self._lock_key = None
+            await self._clear_chat_states()
             if client:
                 await client.disconnect()
         finally:
@@ -1259,6 +1283,7 @@ class XMPPAdapter(BasePlatformAdapter):
         self._client = None
         _release_xmpp_identity_lock(self._lock_key)
         self._lock_key = None
+        await self._clear_chat_states()
         self._set_fatal_error("connection_lost", f"XMPP connection lost: {reason}", retryable=True)
         await self._notify_fatal_error()
 
@@ -1276,7 +1301,7 @@ class XMPPAdapter(BasePlatformAdapter):
         assert client is not None
         target = _normalize_target(chat_id)
         message_type = "groupchat" if (metadata or {}).get("chat_type") == "group" or _is_group_jid(target) else "chat"
-        thread_id = str((metadata or {}).get("thread_id") or reply_to or "").strip() or None
+        thread_id = _optional_thread_id((metadata or {}).get("thread_id"))
         try:
             message_ids: list[str] = []
             for index, chunk in enumerate(split_text_for_xmpp(content, self.settings.text_chunk_limit)):
@@ -1286,6 +1311,13 @@ class XMPPAdapter(BasePlatformAdapter):
                     message_type,
                     thread_id=thread_id,
                 )
+                if self.settings.send_chat_states and message_type == "chat":
+                    await self._remember_chat_state(
+                        target,
+                        "active",
+                        message_type,
+                        thread_id,
+                    )
                 message_ids.append(message_id)
                 self._sent_text_by_message_id[message_id] = chunk
             return SendResult(
@@ -1355,7 +1387,9 @@ class XMPPAdapter(BasePlatformAdapter):
         visible send instead of disappearing.
         """
         async with self._status_progress_lock:
-            key = (str(chat_id), str(status_key))
+            thread_id = _optional_thread_id((metadata or {}).get("thread_id"))
+            lane = (str(chat_id), thread_id)
+            key = (*lane, str(status_key))
             if key in self._disabled_status_keys:
                 return SendResult(
                     success=False,
@@ -1363,7 +1397,8 @@ class XMPPAdapter(BasePlatformAdapter):
                     retryable=False,
                 )
             limit = self.settings.tool_progress_bubble_limit
-            if limit >= 0 and self._tool_progress_bubbles_sent >= limit:
+            progress_count = self._tool_progress_bubbles_sent.get(lane, 0)
+            if limit >= 0 and progress_count >= limit:
                 self._disabled_status_keys.add(key)
                 return SendResult(
                     success=False,
@@ -1372,8 +1407,9 @@ class XMPPAdapter(BasePlatformAdapter):
                 )
 
             def _record_progress_success() -> None:
-                self._tool_progress_bubbles_sent += 1
-                if limit >= 0 and self._tool_progress_bubbles_sent >= limit:
+                progress_count = self._tool_progress_bubbles_sent.get(lane, 0) + 1
+                self._tool_progress_bubbles_sent[lane] = progress_count
+                if limit >= 0 and progress_count >= limit:
                     self._disabled_status_keys.add(key)
 
             if self.settings.progress_delivery != "edit":
@@ -1447,7 +1483,21 @@ class XMPPAdapter(BasePlatformAdapter):
                 retryable=False,
             )
         try:
-            await edit(target, message_id, str(content or ""), message_type)
+            thread_id = _optional_thread_id((metadata or {}).get("thread_id"))
+            await edit(
+                target,
+                message_id,
+                str(content or ""),
+                message_type,
+                thread_id=thread_id,
+            )
+            if self.settings.send_chat_states and message_type == "chat":
+                await self._remember_chat_state(
+                    target,
+                    "active",
+                    message_type,
+                    thread_id,
+                )
             self._sent_text_by_message_id[message_id] = str(content or "")
             return SendResult(success=True, message_id=message_id)
         except RuntimeError as exc:
@@ -1485,10 +1535,13 @@ class XMPPAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Media file not found: {file_path}", retryable=False)
         detected_type = content_type or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         target, message_type = self._message_type_for_target(chat_id, metadata)
+        thread_id = _optional_thread_id((metadata or {}).get("thread_id"))
         try:
             url = await client.upload_file(str(path), detected_type)
             text = f"{caption}\n{url}" if caption else url
-            message_id = await client.send_message(target, text, message_type, thread_id=reply_to, oob_url=url)
+            message_id = await client.send_message(target, text, message_type, thread_id=thread_id, oob_url=url)
+            if self.settings.send_chat_states and message_type == "chat":
+                await self._remember_chat_state(target, "active", message_type, thread_id)
             return SendResult(success=True, message_id=message_id, raw_response={"url": url, "content_type": detected_type})
         except Exception as exc:
             if _is_connection_loss_exception(exc):
@@ -1551,6 +1604,49 @@ class XMPPAdapter(BasePlatformAdapter):
             return None
         return self._last_full_jid_by_chat.get(_bare_jid(target), target), "chat"
 
+    def _chat_state_key(
+        self,
+        to_jid: str,
+        message_type: str,
+        thread_id: str | None,
+    ) -> tuple[str, str, str | None]:
+        return _bare_jid(to_jid), message_type, thread_id
+
+    async def _send_chat_state_transition(
+        self,
+        client: _SlixmppClient,
+        to_jid: str,
+        state: str,
+        message_type: str,
+        thread_id: str | None,
+    ) -> None:
+        key = self._chat_state_key(to_jid, message_type, thread_id)
+        async with self._chat_state_lock:
+            if self._chat_states.get(key) == state:
+                return
+            await client.send_chat_state(
+                to_jid,
+                state,
+                message_type,
+                thread_id=thread_id,
+            )
+            self._chat_states[key] = state
+
+    async def _remember_chat_state(
+        self,
+        to_jid: str,
+        state: str,
+        message_type: str,
+        thread_id: str | None,
+    ) -> None:
+        key = self._chat_state_key(to_jid, message_type, thread_id)
+        async with self._chat_state_lock:
+            self._chat_states[key] = state
+
+    async def _clear_chat_states(self) -> None:
+        async with self._chat_state_lock:
+            self._chat_states.clear()
+
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Send XEP-0085 ``composing`` for the active 1:1 conversation.
 
@@ -1571,15 +1667,16 @@ class XMPPAdapter(BasePlatformAdapter):
         if target is None:
             return
         to_jid, message_type = target
-        thread_id = str((metadata or {}).get("thread_id") or "").strip() or None
+        thread_id = _optional_thread_id((metadata or {}).get("thread_id"))
         self._chat_state_thread.set(thread_id)
         assert client is not None
         try:
-            await client.send_chat_state(
+            await self._send_chat_state_transition(
+                client,
                 to_jid,
                 "composing",
                 message_type,
-                thread_id=thread_id,
+                thread_id,
             )
         except Exception as exc:
             if _is_connection_loss_exception(exc):
@@ -1603,11 +1700,12 @@ class XMPPAdapter(BasePlatformAdapter):
         thread_id = self._chat_state_thread.get()
         assert client is not None
         try:
-            await client.send_chat_state(
+            await self._send_chat_state_transition(
+                client,
                 to_jid,
                 "active",
                 message_type,
-                thread_id=thread_id,
+                thread_id,
             )
         except Exception as exc:
             if _is_connection_loss_exception(exc):
@@ -1626,8 +1724,18 @@ class XMPPAdapter(BasePlatformAdapter):
             if not parsed.message_id:
                 return None
             if parsed.chat_type == "group":
-                return XmppReactionTarget(parsed.chat_id, parsed.message_id, "groupchat")
-            return XmppReactionTarget(parsed.receipt_target, parsed.message_id, "chat")
+                return XmppReactionTarget(
+                    parsed.chat_id,
+                    parsed.message_id,
+                    "groupchat",
+                    _optional_thread_id(parsed.thread_id),
+                )
+            return XmppReactionTarget(
+                parsed.receipt_target,
+                parsed.message_id,
+                "chat",
+                _optional_thread_id(parsed.thread_id),
+            )
 
         source = getattr(event, "source", None)
         message_id = str(getattr(event, "message_id", "") or getattr(source, "message_id", "") or "")
@@ -1641,7 +1749,12 @@ class XMPPAdapter(BasePlatformAdapter):
         if not _authorized_direct_message(self.settings, user_id):
             return None
         target = self._last_full_jid_by_chat.get(_bare_jid(chat_id), _normalize_target(chat_id))
-        return XmppReactionTarget(target, message_id, "chat")
+        return XmppReactionTarget(
+            target,
+            message_id,
+            "chat",
+            _optional_thread_id(getattr(source, "thread_id", None)),
+        )
 
     async def _send_reactions_to_target(self, target: XmppReactionTarget, reactions: Any) -> bool:
         client = self._client
@@ -1660,6 +1773,7 @@ class XMPPAdapter(BasePlatformAdapter):
                     target.message_id,
                     normalized,
                     target.message_type,
+                    thread_id=target.thread_id,
                 )
             )
         except Exception as exc:
@@ -1692,7 +1806,7 @@ class XMPPAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         source = getattr(event, "source", None)
-        thread_id = str(getattr(source, "thread_id", None) or "").strip() or None
+        thread_id = _optional_thread_id(getattr(source, "thread_id", None))
         self._chat_state_thread.set(thread_id)
         target = self._reaction_target_for_event(event)
         reaction = self._pick_processing_reaction(self.settings.reaction_start_choices)
@@ -1780,6 +1894,8 @@ async def _standalone_send(
     if not await adapter.connect():
         return {"error": adapter.fatal_error_message or "XMPP standalone connect failed"}
     try:
+        thread_id = _optional_thread_id(thread_id)
+        thread_metadata = {"thread_id": thread_id} if thread_id is not None else None
         if media_files:
             message_ids: list[str] = []
             for media_item in media_files:
@@ -1787,13 +1903,33 @@ async def _standalone_send(
                 media_path = str(media_path)
                 suffix = Path(media_path).suffix.lower()
                 if suffix in IMAGE_EXTENSIONS and not force_document:
-                    result = await adapter.send_image_file(chat_id, media_path, caption=message or None, reply_to=thread_id)
+                    result = await adapter.send_image_file(
+                        chat_id,
+                        media_path,
+                        caption=message or None,
+                        metadata=thread_metadata,
+                    )
                 elif (is_voice or suffix in AUDIO_EXTENSIONS) and not force_document:
-                    result = await adapter.send_voice(chat_id, media_path, caption=message or None, reply_to=thread_id)
+                    result = await adapter.send_voice(
+                        chat_id,
+                        media_path,
+                        caption=message or None,
+                        metadata=thread_metadata,
+                    )
                 elif suffix in VIDEO_EXTENSIONS and not force_document:
-                    result = await adapter.send_video(chat_id, media_path, caption=message or None, reply_to=thread_id)
+                    result = await adapter.send_video(
+                        chat_id,
+                        media_path,
+                        caption=message or None,
+                        metadata=thread_metadata,
+                    )
                 else:
-                    result = await adapter.send_document(chat_id, media_path, caption=message or None, reply_to=thread_id)
+                    result = await adapter.send_document(
+                        chat_id,
+                        media_path,
+                        caption=message or None,
+                        metadata=thread_metadata,
+                    )
                 if not result.success:
                     return {"error": result.error or "XMPP standalone media send failed"}
                 if result.message_id:
@@ -1804,7 +1940,7 @@ async def _standalone_send(
             if len(message_ids) > 1:
                 response["continuation_message_ids"] = message_ids[1:]
             return response
-        result = await adapter.send(chat_id, message, reply_to=thread_id)
+        result = await adapter.send(chat_id, message, metadata=thread_metadata)
         if result.success:
             return {"success": True, "message_id": result.message_id}
         return {"error": result.error or "XMPP standalone send failed"}
