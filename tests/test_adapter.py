@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 import sys
@@ -322,6 +323,22 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(adapter.authorized_xmpp_message(parsed, settings))
         self.assertEqual(adapter.event_text_for(parsed, settings), "hello")
 
+    def test_parse_preserves_xep_0201_thread(self):
+        settings = self._settings()
+        parsed = adapter.parse_xmpp_message(
+            FakeMessage(
+                body="hello",
+                **{"from": "thanos@example.org/dino"},
+                type="chat",
+                id="m-thread",
+                thread="thread-42",
+            ),
+            settings,
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.thread_id, "thread-42")
+
     def test_unauthorized_messages_do_not_get_receipt_actions(self):
         settings = self._settings()
         msg = FakeMessage(
@@ -440,6 +457,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "server": "chat.example.org",
             "password": "secret",
             "allowed_users": ["thanos@example.org"],
+            "reactions_enabled": False,
         })
         xmpp = adapter.XMPPAdapter(cfg)
 
@@ -447,8 +465,8 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def send_chat_state(self, to_jid, state, message_type="chat"):
-                self.calls.append((state, to_jid, message_type))
+            async def send_chat_state(self, to_jid, state, message_type="chat", *, thread_id=None):
+                self.calls.append((state, to_jid, message_type, thread_id))
 
         fake_client = FakeClient()
         xmpp._client = fake_client
@@ -464,13 +482,97 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
         await xmpp.on_xmpp_message(msg)
 
-        await xmpp.send_typing("thanos@example.org")
+        typing_task = asyncio.create_task(xmpp.send_typing(
+            "thanos@example.org",
+            metadata={"thread_id": "thread-42"},
+        ))
+        await xmpp.on_processing_start(types.SimpleNamespace(
+            source=types.SimpleNamespace(thread_id="thread-42"),
+        ))
+        await typing_task
+        await xmpp.stop_typing("thanos@example.org")
         await xmpp.stop_typing("thanos@example.org")
 
         self.assertEqual(fake_client.calls, [
-            ("composing", "thanos@example.org/dino", "chat"),
-            ("active", "thanos@example.org/dino", "chat"),
+            ("composing", "thanos@example.org/dino", "chat", "thread-42"),
+            ("active", "thanos@example.org/dino", "chat", "thread-42"),
+            ("active", "thanos@example.org/dino", "chat", "thread-42"),
         ])
+
+    async def test_concurrent_thread_chat_states_keep_task_ownership(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "allowed_users": ["thanos@example.org"],
+            "reactions_enabled": False,
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_chat_state(self, to_jid, state, message_type="chat", *, thread_id=None):
+                self.calls.append((state, thread_id))
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        ready = asyncio.Event()
+        started = 0
+
+        async def run_thread(thread_id):
+            nonlocal started
+            typing_task = asyncio.create_task(xmpp.send_typing(
+                "thanos@example.org",
+                metadata={"thread_id": thread_id},
+            ))
+            await xmpp.on_processing_start(types.SimpleNamespace(
+                source=types.SimpleNamespace(thread_id=thread_id),
+            ))
+            await typing_task
+            started += 1
+            if started == 2:
+                ready.set()
+            await ready.wait()
+            await xmpp.stop_typing("thanos@example.org")
+            await xmpp.stop_typing("thanos@example.org")
+
+        await asyncio.gather(run_thread("thread-a"), run_thread("thread-b"))
+
+        self.assertCountEqual(fake_client.calls, [
+            ("composing", "thread-a"),
+            ("active", "thread-a"),
+            ("active", "thread-a"),
+            ("composing", "thread-b"),
+            ("active", "thread-b"),
+            ("active", "thread-b"),
+        ])
+
+    async def test_adapter_puts_incoming_thread_on_message_source(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "allowed_users": ["thanos@example.org"],
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+        handled_events = []
+
+        async def capture_event(event):
+            handled_events.append(event)
+
+        xmpp.handle_message = capture_event
+        xmpp._client = types.SimpleNamespace()
+        await xmpp.on_xmpp_message(FakeMessage(
+            body="ping",
+            **{"from": "thanos@example.org/dino"},
+            type="chat",
+            id="m-thread",
+            thread="thread-42",
+        ))
+
+        self.assertEqual(handled_events[0].source.thread_id, "thread-42")
 
     async def test_adapter_does_not_send_chat_state_when_disconnected(self):
         cfg = types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"})
@@ -663,6 +765,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "thanos@example.org",
             "caption\nhttps://upload.example.org/image.png",
             "chat",
+            thread_id="thread-42",
             oob_url="https://upload.example.org/image.png",
         )
 
@@ -672,7 +775,44 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(msg.sent)
         self.assertEqual(msg.values["oob"]["url"], "https://upload.example.org/image.png")
         self.assertEqual(msg.values["chat_state"], "active")
+        self.assertEqual(msg.values["thread"], "thread-42")
         self.assertEqual(thin.client.send_message_calls, [])
+
+    async def test_slixmpp_chat_state_preserves_xep_0201_thread(self):
+        class FakeMessage:
+            def __init__(self):
+                self.values = {}
+                self.sent = False
+
+            def __setitem__(self, key, value):
+                self.values[key] = value
+
+            def send(self):
+                self.sent = True
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            def make_message(self, *, mto=None, mtype=None):
+                msg = FakeMessage()
+                msg.values.update({"to": mto, "type": mtype})
+                self.messages.append(msg)
+                return msg
+
+        thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        thin.client = FakeClient()
+
+        await thin.send_chat_state(
+            "thanos@example.org/dino",
+            "composing",
+            "chat",
+            thread_id="thread-42",
+        )
+
+        self.assertEqual(thin.client.messages[0].values["thread"], "thread-42")
+        self.assertEqual(thin.client.messages[0].values["chat_state"], "composing")
+        self.assertTrue(thin.client.messages[0].sent)
 
     async def test_slixmpp_client_edit_message_sends_xep_0308_correction(self):
         class FakeCorrectionPlugin:
@@ -1114,14 +1254,19 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         fake_client = FakeClient()
         xmpp._client = cast(Any, fake_client)
 
-        result = await xmpp.send("thanos@example.org", "hello brave little world", reply_to="orig-msg")
+        result = await xmpp.send(
+            "thanos@example.org",
+            "hello brave little world",
+            reply_to="orig-msg",
+            metadata={"thread_id": "thread-42"},
+        )
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "msg-2")
         self.assertEqual(result.continuation_message_ids, ("msg-1",))
         self.assertEqual(fake_client.messages, [
-            ("thanos@example.org", "hello brave", "chat", "orig-msg", None),
-            ("thanos@example.org", "little world", "chat", None, None),
+            ("thanos@example.org", "hello brave", "chat", "thread-42", None),
+            ("thanos@example.org", "little world", "chat", "thread-42", None),
         ])
 
     async def test_media_upload_deterministic_failures_are_not_retryable(self):
@@ -1196,7 +1341,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.message_id, "msg-3")
         self.assertEqual(result.continuation_message_ids, ("msg-1", "msg-2"))
         self.assertEqual([call[1] for call in fake_client.messages], ["hello", "there", "friend"])
-        self.assertEqual([call[3] for call in fake_client.messages], ["root", None, None])
+        self.assertEqual([call[3] for call in fake_client.messages], ["root", "root", "root"])
 
     def test_declared_media_kinds_tracks_future_fail_closed_gateway_api(self):
         old_media_kind = adapter.MediaKind

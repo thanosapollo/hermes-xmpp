@@ -6,6 +6,7 @@ Hermes-native adapter code; OpenClaw is only a behavior reference.
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import logging
 import inspect
 import mimetypes
@@ -543,6 +544,7 @@ class ParsedXmppMessage:
     user_id: str
     user_name: str
     receipt_target: str
+    thread_id: str = ""
     wants_delivery_receipt: bool = False
     wants_chat_marker: bool = False
     marker_id: str = ""
@@ -665,6 +667,7 @@ def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | 
     from_jid = _bare_jid(raw_from)
     msg_type = str(_msg_get(msg, "type", "chat") or "chat")
     message_id = _extract_message_id(msg)
+    thread_id = str(_msg_get(msg, "thread", "") or "").strip()
     wants_delivery_receipt = _message_requests_delivery_receipt(msg)
     wants_chat_marker = _message_requests_chat_marker(msg)
     is_marker_or_receipt = _message_has_marker_or_receipt(msg)
@@ -683,6 +686,7 @@ def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | 
             user_id=sender_jid,
             user_name=nick or sender_jid,
             receipt_target=from_jid,
+            thread_id=thread_id,
             wants_delivery_receipt=wants_delivery_receipt,
             wants_chat_marker=wants_chat_marker,
             marker_id=_marker_reference_id(msg, message_id),
@@ -701,6 +705,7 @@ def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | 
         user_id=from_jid,
         user_name=from_jid,
         receipt_target=raw_from or from_jid,
+        thread_id=thread_id,
         wants_delivery_receipt=wants_delivery_receipt,
         wants_chat_marker=wants_chat_marker,
         marker_id=_marker_reference_id(msg, message_id),
@@ -1035,11 +1040,20 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
             # slixmpp versions differ slightly; fall back to the minimal call.
             return await uploader.upload_file(Path(file_path))
 
-    async def send_chat_state(self, to_jid: str, state: str, message_type: str = "chat") -> None:
+    async def send_chat_state(
+        self,
+        to_jid: str,
+        state: str,
+        message_type: str = "chat",
+        *,
+        thread_id: str | None = None,
+    ) -> None:
         if state not in {"active", "composing", "paused", "inactive", "gone"}:
             raise ValueError(f"unsupported XMPP chat state: {state}")
         msg = self.client.make_message(mto=to_jid, mtype=message_type)
         msg["chat_state"] = state
+        if thread_id:
+            msg["thread"] = thread_id
         msg.send()
 
     async def send_delivery_receipt(self, to_jid: str, receipt_id: str, message_type: str = "chat") -> None:
@@ -1157,6 +1171,10 @@ class XMPPAdapter(BasePlatformAdapter):
         self.settings = XmppSettings.from_config(config)
         self._client: Optional[_SlixmppClient] = None
         self._last_full_jid_by_chat: dict[str, str] = {}
+        self._chat_state_thread: ContextVar[str | None] = ContextVar(
+            "hermes_xmpp_chat_state_thread",
+            default=None,
+        )
         self._sent_text_by_message_id: dict[str, str] = {}
         self._tool_progress_bubbles_sent = 0
         self._status_message_ids: dict[tuple[str, str], str] = {}
@@ -1258,6 +1276,7 @@ class XMPPAdapter(BasePlatformAdapter):
         assert client is not None
         target = _normalize_target(chat_id)
         message_type = "groupchat" if (metadata or {}).get("chat_type") == "group" or _is_group_jid(target) else "chat"
+        thread_id = str((metadata or {}).get("thread_id") or reply_to or "").strip() or None
         try:
             message_ids: list[str] = []
             for index, chunk in enumerate(split_text_for_xmpp(content, self.settings.text_chunk_limit)):
@@ -1265,7 +1284,7 @@ class XMPPAdapter(BasePlatformAdapter):
                     target,
                     chunk,
                     message_type,
-                    thread_id=reply_to if index == 0 else None,
+                    thread_id=thread_id,
                 )
                 message_ids.append(message_id)
                 self._sent_text_by_message_id[message_id] = chunk
@@ -1552,9 +1571,16 @@ class XMPPAdapter(BasePlatformAdapter):
         if target is None:
             return
         to_jid, message_type = target
+        thread_id = str((metadata or {}).get("thread_id") or "").strip() or None
+        self._chat_state_thread.set(thread_id)
         assert client is not None
         try:
-            await client.send_chat_state(to_jid, "composing", message_type)
+            await client.send_chat_state(
+                to_jid,
+                "composing",
+                message_type,
+                thread_id=thread_id,
+            )
         except Exception as exc:
             if _is_connection_loss_exception(exc):
                 await self.on_xmpp_disconnected(exc, client=client)
@@ -1574,9 +1600,15 @@ class XMPPAdapter(BasePlatformAdapter):
         if target is None:
             return
         to_jid, message_type = target
+        thread_id = self._chat_state_thread.get()
         assert client is not None
         try:
-            await client.send_chat_state(to_jid, "active", message_type)
+            await client.send_chat_state(
+                to_jid,
+                "active",
+                message_type,
+                thread_id=thread_id,
+            )
         except Exception as exc:
             if _is_connection_loss_exception(exc):
                 await self.on_xmpp_disconnected(exc, client=client)
@@ -1659,6 +1691,9 @@ class XMPPAdapter(BasePlatformAdapter):
         return str(random.choice(choices))
 
     async def on_processing_start(self, event: MessageEvent) -> None:
+        source = getattr(event, "source", None)
+        thread_id = str(getattr(source, "thread_id", None) or "").strip() or None
+        self._chat_state_thread.set(thread_id)
         target = self._reaction_target_for_event(event)
         reaction = self._pick_processing_reaction(self.settings.reaction_start_choices)
         if target is not None and reaction:
@@ -1694,6 +1729,7 @@ class XMPPAdapter(BasePlatformAdapter):
             user_id=parsed.user_id,
             user_name=parsed.user_name,
             message_id=parsed.message_id,
+            thread_id=parsed.thread_id or None,
         )
         event = MessageEvent(
             text=event_text_for(parsed, self.settings),
