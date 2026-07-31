@@ -133,16 +133,12 @@ optional_env:
     prompt: "Failure reaction choices"
     password: false
   - name: XMPP_PROGRESS_DELIVERY
-    description: "Progress/status delivery: messages (default visible messages) or edit (XEP-0308 corrections)"
-    prompt: "Progress delivery mode"
+    description: "Lifecycle status delivery: messages (default) or edit (capability-gated XEP-0308 corrections)"
+    prompt: "Lifecycle status delivery mode"
     password: false
   - name: XMPP_EDITABLE_PROGRESS
-    description: "When progress delivery is edit: known (probe recipient support, default), force (always send XEP-0308), or disabled"
-    prompt: "Editable progress policy"
-    password: false
-  - name: XMPP_TOOL_PROGRESS_BUBBLE_LIMIT
-    description: "Max tool-progress/status updates per chat and XMPP thread before that status key is disabled; default 30; 0 disables immediately"
-    prompt: "Tool progress bubble limit"
+    description: "When lifecycle status delivery is edit: known (probe recipient support, default), force (always send XEP-0308), or disabled"
+    prompt: "Editable lifecycle status policy"
     password: false
   - name: XMPP_ANONYMOUS_MUC_POLICY
     description: "Anonymous MUC nick handling: mention_only (default), allow, or deny"

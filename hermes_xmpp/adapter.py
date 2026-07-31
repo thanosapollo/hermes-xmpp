@@ -363,7 +363,6 @@ class XmppSettings:
     reaction_success_choices: tuple[str, ...] = ("✅",)
     reaction_failure_choices: tuple[str, ...] = ("❌",)
     text_chunk_limit: int = 4000
-    tool_progress_bubble_limit: int = 30
     editable_progress_policy: str = "known"
     progress_delivery: str = "messages"
 
@@ -408,13 +407,6 @@ class XmppSettings:
                 os.getenv("XMPP_ALLOWED_ROOMS") or extra.get("allowed_rooms", room_values)
             )
         }
-        tool_progress_parsed = _int_or_none(
-            _first_env_or_config(
-                extra,
-                ("XMPP_TOOL_PROGRESS_BUBBLE_LIMIT",),
-                ("tool_progress_bubble_limit",),
-            )
-        )
         return cls(
             jid=jid,
             server=str(
@@ -512,7 +504,6 @@ class XmppSettings:
                 )
             )
             or 4000,
-            tool_progress_bubble_limit=30 if tool_progress_parsed is None else tool_progress_parsed,
             editable_progress_policy=_normalize_policy(
                 os.getenv("XMPP_EDITABLE_PROGRESS") or extra.get("editable_progress_policy", extra.get("editable_progress")),
                 "known",
@@ -1199,9 +1190,7 @@ class XMPPAdapter(BasePlatformAdapter):
         self._chat_states: dict[tuple[str, str, str | None], str] = {}
         self._chat_state_lock = asyncio.Lock()
         self._sent_text_by_message_id: dict[str, str] = {}
-        self._tool_progress_bubbles_sent: dict[tuple[str, str | None], int] = {}
         self._status_message_ids: dict[tuple[str, str | None, str], str] = {}
-        self._disabled_status_keys: set[tuple[str, str | None, str]] = set()
         self._status_progress_lock = asyncio.Lock()
         self._lock_key: str | None = None
         self._operator_disconnect = False
@@ -1388,42 +1377,21 @@ class XMPPAdapter(BasePlatformAdapter):
         """
         async with self._status_progress_lock:
             thread_id = _optional_thread_id((metadata or {}).get("thread_id"))
-            lane = (str(chat_id), thread_id)
-            key = (*lane, str(status_key))
-            if key in self._disabled_status_keys:
-                return SendResult(
-                    success=False,
-                    error="XMPP editable status is disabled for this chat/status key",
-                    retryable=False,
-                )
-            limit = self.settings.tool_progress_bubble_limit
-            progress_count = self._tool_progress_bubbles_sent.get(lane, 0)
-            if limit >= 0 and progress_count >= limit:
-                self._disabled_status_keys.add(key)
-                return SendResult(
-                    success=False,
-                    error="XMPP editable status is disabled for this chat/status key",
-                    retryable=False,
-                )
-
-            def _record_progress_success() -> None:
-                progress_count = self._tool_progress_bubbles_sent.get(lane, 0) + 1
-                self._tool_progress_bubbles_sent[lane] = progress_count
-                if limit >= 0 and progress_count >= limit:
-                    self._disabled_status_keys.add(key)
+            key = (str(chat_id), thread_id, str(status_key))
 
             if self.settings.progress_delivery != "edit":
-                result = await self.send(chat_id, content, metadata=metadata)
-                if result.success:
-                    _record_progress_success()
-                return result
+                return await self.send(chat_id, content, metadata=metadata)
             cached_id = self._status_message_ids.get(key)
             if cached_id:
-                result = await self.edit_message(chat_id, cached_id, content, metadata=metadata)
+                result = await self._edit_status_message(
+                    chat_id,
+                    cached_id,
+                    content,
+                    metadata=metadata,
+                )
                 if result.success:
                     if result.message_id:
                         self._status_message_ids[key] = str(result.message_id)
-                    _record_progress_success()
                     return result
                 if not result.retryable:
                     # Mirror Telegram's status fallback: if a correction cannot be
@@ -1433,16 +1401,14 @@ class XMPPAdapter(BasePlatformAdapter):
                     fresh = await self.send(chat_id, content, metadata=metadata)
                     if fresh.success and fresh.message_id:
                         self._status_message_ids[key] = str(fresh.message_id)
-                        _record_progress_success()
                     return fresh
                 return result
             result = await self.send(chat_id, content, metadata=metadata)
             if result.success and result.message_id:
                 self._status_message_ids[key] = str(result.message_id)
-                _record_progress_success()
             return result
 
-    async def edit_message(
+    async def _edit_status_message(
         self,
         chat_id: str,
         message_id: str,
@@ -1450,14 +1416,13 @@ class XMPPAdapter(BasePlatformAdapter):
         metadata: Optional[dict[str, Any]] = None,
         **_: Any,
     ) -> SendResult:
-        """Opt XMPP into Hermes tool progress with XEP-0308 edits.
+        """Edit an adapter-owned lifecycle status with XEP-0308.
 
-        Hermes' gateway treats an ``edit_message`` override as progress support.
-        When the connected client supports XEP-0308 Last Message Correction,
-        update the existing progress/status bubble by sending a correction
-        stanza.  If correction support is unavailable, fail without sending
-        extra fallback messages here; the gateway can decide whether to degrade
-        to per-line progress, and this adapter avoids doubling/spamming updates.
+        Generic ``edit_message`` stays inherited from ``BasePlatformAdapter``:
+        recipient-specific XEP-0308 support cannot honestly satisfy Hermes'
+        platform-wide tool-progress editing contract. Lifecycle status routing
+        can still probe the recipient, edit when supported, and fall back to a
+        fresh visible status through ``send_or_update_status``.
         """
         client = self._client
         if not self._client_is_connected():

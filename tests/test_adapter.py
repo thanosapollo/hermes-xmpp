@@ -157,23 +157,6 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.reaction_success_choices, ("✅",))
         self.assertEqual(settings.reaction_failure_choices, ("❌",))
 
-    def test_tool_progress_bubble_limit_defaults_and_accepts_env(self):
-        cfg = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "chat.example.org", "password": "secret"})
-        self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 30)
-        os.environ["XMPP_TOOL_PROGRESS_BUBBLE_LIMIT"] = "2"
-        self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 2)
-        os.environ["XMPP_TOOL_PROGRESS_BUBBLE_LIMIT"] = "0"
-        self.assertEqual(adapter.XmppSettings.from_config(cfg).tool_progress_bubble_limit, 0)
-        cfg_zero = types.SimpleNamespace(
-            extra={
-                "jid": "bot@example.org",
-                "server": "chat.example.org",
-                "password": "secret",
-                "tool_progress_bubble_limit": 0,
-            }
-        )
-        self.assertEqual(adapter.XmppSettings.from_config(cfg_zero).tool_progress_bubble_limit, 0)
-
     def test_editable_progress_policy_defaults_to_known_support_and_accepts_env(self):
         cfg = types.SimpleNamespace(extra={"jid": "bot@example.org", "server": "chat.example.org", "password": "secret"})
 
@@ -690,7 +673,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "thanos@example.org",
             metadata={"thread_id": "thread-42"},
         )
-        result = await xmpp.edit_message(
+        result = await xmpp._edit_status_message(
             "thanos@example.org",
             "status-1",
             "new",
@@ -1060,13 +1043,13 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "XEP-0308"):
             await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
 
-    def test_adapter_declares_non_base_edit_message_for_gateway_progress(self):
-        self.assertIsNot(
+    def test_adapter_does_not_advertise_generic_message_editing(self):
+        self.assertIs(
             type(adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))).edit_message,
             adapter.BasePlatformAdapter.edit_message,
         )
 
-    async def test_tool_progress_edits_existing_status_bubble_with_xep_0308(self):
+    async def test_lifecycle_status_edits_existing_bubble_with_xep_0308(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
             "server": "chat.example.org",
@@ -1101,13 +1084,13 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "🔍 search_files...",
             metadata=thread_metadata,
         )
-        edit = await xmpp.edit_message(
+        edit = await xmpp._edit_status_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
             metadata=thread_metadata,
         )
-        duplicate = await xmpp.edit_message(
+        duplicate = await xmpp._edit_status_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
@@ -1124,7 +1107,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("thanos@example.org", cast(str, first.message_id), "🔍 search_files...\n📖 read_file...", "chat", " progress-thread "),
         ])
 
-    async def test_tool_progress_edit_unsupported_fails_without_sending_extra_bubbles(self):
+    async def test_lifecycle_status_edit_unsupported_fails_without_extra_bubbles(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
             "server": "chat.example.org",
@@ -1151,7 +1134,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         xmpp._client = cast(Any, fake_client)
 
         first = await xmpp.send("thanos@example.org", "🔍 search_files...")
-        result = await xmpp.edit_message(
+        result = await xmpp._edit_status_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
@@ -1406,7 +1389,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         xmpp._client = cast(Any, fake_client)
         xmpp._sent_text_by_message_id["muc-status-1"] = "old"
 
-        result = await xmpp.edit_message(
+        result = await xmpp._edit_status_message(
             "room@muc.example.org",
             "muc-status-1",
             "new",
@@ -1417,165 +1400,6 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.edits, [
             ("room@muc.example.org", "muc-status-1", "new", "groupchat", " muc-thread "),
         ])
-
-    async def test_send_or_update_status_enforces_tool_progress_bubble_limit(self):
-        cfg = types.SimpleNamespace(extra={
-            "jid": "emma@example.org",
-            "server": "chat.example.org",
-            "password": "secret",
-            "progress_delivery": "edit",
-            "tool_progress_bubble_limit": 2,
-        })
-        xmpp = adapter.XMPPAdapter(cfg)
-
-        class FakeClient:
-            def __init__(self):
-                self.messages = []
-                self.edits = []
-
-            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
-                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
-                return f"msg-{len(self.messages)}"
-
-            async def supports_message_correction(self, to_jid, message_type):
-                return True
-
-            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
-                self.edits.append((to_jid, message_id, text, message_type))
-                return f"edit-{len(self.edits)}"
-
-        fake_client = FakeClient()
-        xmpp._client = cast(Any, fake_client)
-
-        first = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "one")
-        second = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "two")
-        third = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "three")
-
-        self.assertTrue(first.success)
-        self.assertTrue(second.success)
-        self.assertEqual(xmpp._tool_progress_bubbles_sent[("thanos@example.org", None)], 2)
-        self.assertIn(("thanos@example.org", None, "lifecycle"), xmpp._disabled_status_keys)
-        self.assertFalse(third.success)
-        self.assertFalse(third.retryable)
-        self.assertIn("disabled", cast(str, third.error).lower())
-        self.assertEqual(len(fake_client.messages), 1)
-        self.assertEqual(len(fake_client.edits), 1)
-
-    async def test_tool_progress_limit_is_independent_per_thread(self):
-        cfg = types.SimpleNamespace(extra={
-            "jid": "emma@example.org",
-            "server": "chat.example.org",
-            "password": "secret",
-            "tool_progress_bubble_limit": 1,
-        })
-        xmpp = adapter.XMPPAdapter(cfg)
-
-        class FakeClient:
-            def __init__(self):
-                self.messages = []
-
-            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
-                self.messages.append((text, thread_id))
-                return f"msg-{len(self.messages)}"
-
-        fake_client = FakeClient()
-        xmpp._client = cast(Any, fake_client)
-
-        first = await xmpp.send_or_update_status(
-            "thanos@example.org",
-            "lifecycle",
-            "thread A",
-            metadata={"thread_id": "thread-a"},
-        )
-        second = await xmpp.send_or_update_status(
-            "thanos@example.org",
-            "lifecycle",
-            "thread B",
-            metadata={"thread_id": "thread-b"},
-        )
-
-        self.assertTrue(first.success)
-        self.assertTrue(second.success)
-        self.assertEqual(fake_client.messages, [
-            ("thread A", "thread-a"),
-            ("thread B", "thread-b"),
-        ])
-
-    async def test_tool_progress_limit_zero_disables_first_status_update(self):
-        cfg = types.SimpleNamespace(extra={
-            "jid": "emma@example.org",
-            "server": "chat.example.org",
-            "password": "secret",
-            "tool_progress_bubble_limit": 0,
-        })
-        xmpp = adapter.XMPPAdapter(cfg)
-
-        class FakeClient:
-            def __init__(self):
-                self.messages = []
-
-            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
-                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
-                return f"msg-{len(self.messages)}"
-
-        fake_client = FakeClient()
-        xmpp._client = cast(Any, fake_client)
-
-        result = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "blocked")
-
-        self.assertFalse(result.success)
-        self.assertFalse(result.retryable)
-        self.assertIn("disabled", cast(str, result.error).lower())
-        self.assertEqual(fake_client.messages, [])
-        self.assertIn(("thanos@example.org", None, "lifecycle"), xmpp._disabled_status_keys)
-        self.assertEqual(xmpp._tool_progress_bubbles_sent.get(("thanos@example.org", None), 0), 0)
-
-    async def test_tool_progress_limit_is_atomic_within_one_lane(self):
-        cfg = types.SimpleNamespace(extra={
-            "jid": "emma@example.org",
-            "server": "chat.example.org",
-            "password": "secret",
-            "tool_progress_bubble_limit": 1,
-        })
-        xmpp = adapter.XMPPAdapter(cfg)
-        release = __import__("asyncio").Event()
-        started = __import__("asyncio").Event()
-
-        class BlockingClient:
-            def __init__(self):
-                self.messages = []
-
-            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
-                self.messages.append((to_jid, text, message_type, thread_id, oob_url))
-                started.set()
-                await release.wait()
-                return f"msg-{len(self.messages)}"
-
-        fake_client = BlockingClient()
-        xmpp._client = cast(Any, fake_client)
-        loop = __import__("asyncio").get_event_loop()
-
-        first_task = loop.create_task(
-            xmpp.send_or_update_status("a@example.org", "one", "first")
-        )
-        await started.wait()
-        second_task = loop.create_task(
-            xmpp.send_or_update_status("a@example.org", "two", "second")
-        )
-        # Give the second caller a chance to race the unlocked path if present.
-        await __import__("asyncio").sleep(0)
-        release.set()
-        first, second = await __import__("asyncio").gather(first_task, second_task)
-
-        successes = [result for result in (first, second) if result.success]
-        failures = [result for result in (first, second) if not result.success]
-        self.assertEqual(len(successes), 1)
-        self.assertEqual(len(failures), 1)
-        self.assertFalse(failures[0].retryable)
-        self.assertIn("disabled", cast(str, failures[0].error).lower())
-        self.assertEqual(xmpp._tool_progress_bubbles_sent[("a@example.org", None)], 1)
-        self.assertEqual(len(fake_client.messages), 1)
-        self.assertEqual(len(xmpp._disabled_status_keys), 2)
 
     async def test_adapter_chunks_long_text_and_returns_continuation_ids(self):
         cfg = types.SimpleNamespace(extra={
