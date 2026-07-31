@@ -1284,6 +1284,12 @@ class XMPPAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
+        if (metadata or {}).get("expect_edits"):
+            return SendResult(
+                success=False,
+                error="XMPP does not support editable stream previews",
+                retryable=False,
+            )
         client = self._client
         if not self._client_is_connected():
             await self.on_xmpp_disconnected("send attempted while disconnected", client=client)

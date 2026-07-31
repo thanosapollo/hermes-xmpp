@@ -1052,6 +1052,32 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(xmpp.SUPPORTS_MESSAGE_EDITING, False)
 
+    async def test_adapter_rejects_editable_preview_then_sends_one_full_final(self):
+        xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append(text)
+                return f"msg-{len(self.messages)}"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        preview = await xmpp.send(
+            "thanos@example.org",
+            "partial",
+            metadata={"expect_edits": True},
+        )
+        final = await xmpp.send("thanos@example.org", "complete final")
+
+        self.assertFalse(preview.success)
+        self.assertFalse(preview.retryable)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.messages, ["complete final"])
+
     async def test_lifecycle_status_edits_existing_bubble_with_xep_0308(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
