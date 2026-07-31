@@ -562,6 +562,36 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("active", "thread-b"),
         ])
 
+    async def test_chat_state_dedup_distinguishes_full_resources(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_chat_state(self, to_jid, state, message_type="chat", *, thread_id=None):
+                self.calls.append((to_jid, state, thread_id))
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/dino"
+
+        await xmpp.send_typing("thanos@example.org", metadata={"thread_id": "thread-42"})
+        await xmpp.send_typing("thanos@example.org", metadata={"thread_id": "thread-42"})
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/cheogram"
+        await xmpp.send_typing("thanos@example.org", metadata={"thread_id": "thread-42"})
+        await xmpp.send_typing("thanos@example.org", metadata={"thread_id": "thread-42"})
+
+        self.assertEqual(fake_client.calls, [
+            ("thanos@example.org/dino", "composing", "thread-42"),
+            ("thanos@example.org/cheogram", "composing", "thread-42"),
+        ])
+
     async def test_body_reply_active_state_suppresses_redundant_stop(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
@@ -842,10 +872,10 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         thin.client = FakeClient({"xep_0444": reactions_plugin})
 
         sent = await thin.send_reactions(
-            "thanos@example.org",
+            "room@muc.example.org",
             "m1",
             ("👀",),
-            "chat",
+            "groupchat",
             thread_id=" reaction-thread ",
         )
         missing_thin = cast(Any, object.__new__(adapter._SlixmppClient))
@@ -856,6 +886,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(missing)
         self.assertEqual(reactions_plugin.calls[0][1:], ("m1", ("👀",)))
         self.assertEqual(thin.client.messages[0].values["reactions"], {"id": "m1", "values": ("👀",)})
+        self.assertEqual(thin.client.messages[0].values["type"], "groupchat")
         self.assertEqual(thin.client.messages[0].values["thread"], " reaction-thread ")
         self.assertTrue(thin.client.messages[0].store_enabled)
         self.assertTrue(thin.client.messages[0].sent)
@@ -992,16 +1023,31 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "chat",
             thread_id=" correction-thread ",
         )
+        group_replacement_id = await thin.edit_message(
+            "room@muc.example.org",
+            "group-msg-1",
+            "📖 read_file...",
+            "groupchat",
+            thread_id=" group-correction-thread ",
+        )
 
         self.assertTrue(replacement_id.startswith("hermes-"))
-        self.assertEqual(len(thin.client.messages), 1)
+        self.assertTrue(group_replacement_id.startswith("hermes-"))
+        self.assertEqual(len(thin.client.messages), 2)
         msg = thin.client.messages[0]
         self.assertTrue(msg.sent)
         self.assertEqual(msg.values["body"], "📖 read_file...")
         self.assertEqual(msg.values["replace"], {"id": "msg-1"})
         self.assertEqual(msg.values["chat_state"], "active")
         self.assertEqual(msg.values["thread"], " correction-thread ")
-        self.assertEqual(thin.client.plugin["xep_0308"].calls, [(msg, "msg-1")])
+        group_msg = thin.client.messages[1]
+        self.assertEqual(group_msg.values["type"], "groupchat")
+        self.assertEqual(group_msg.values["thread"], " group-correction-thread ")
+        self.assertNotIn("chat_state", group_msg.values)
+        self.assertEqual(thin.client.plugin["xep_0308"].calls, [
+            (msg, "msg-1"),
+            (group_msg, "group-msg-1"),
+        ])
 
     async def test_slixmpp_client_edit_message_raises_when_xep_0308_missing(self):
         class FakeClient:
@@ -1306,6 +1352,70 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(fake_client.messages, [
             ("user@notmuc.example.org", "hello", "chat", None, None),
+        ])
+
+    async def test_threaded_muc_send_preserves_opaque_thread(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
+                self.messages.append((to_jid, text, message_type, thread_id))
+                return "muc-message-1"
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+
+        result = await xmpp.send(
+            "room@muc.example.org",
+            "hello room",
+            metadata={"chat_type": "group", "thread_id": " muc-thread "},
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(fake_client.messages, [
+            ("room@muc.example.org", "hello room", "groupchat", " muc-thread "),
+        ])
+
+    async def test_threaded_muc_correction_preserves_opaque_thread(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+            "editable_progress": "force",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.edits = []
+
+            async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
+                self.edits.append((to_jid, message_id, text, message_type, thread_id))
+                return message_id
+
+        fake_client = FakeClient()
+        xmpp._client = cast(Any, fake_client)
+        xmpp._sent_text_by_message_id["muc-status-1"] = "old"
+
+        result = await xmpp.edit_message(
+            "room@muc.example.org",
+            "muc-status-1",
+            "new",
+            metadata={"chat_type": "group", "thread_id": " muc-thread "},
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(fake_client.edits, [
+            ("room@muc.example.org", "muc-status-1", "new", "groupchat", " muc-thread "),
         ])
 
     async def test_send_or_update_status_enforces_tool_progress_bubble_limit(self):
@@ -1913,7 +2023,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
                 self.calls = []
 
             async def send_reactions(self, to_jid, message_id, reactions, message_type="chat", *, thread_id=None):
-                self.calls.append((to_jid, message_id, tuple(reactions), message_type))
+                self.calls.append((to_jid, message_id, tuple(reactions), message_type, thread_id))
                 return True
 
         fake_client = FakeClient()
@@ -1931,6 +2041,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
             **{"from": "room@muc.example.org/thanos"},
             type="groupchat",
             id="muc2",
+            thread=" muc-thread ",
             muc={"jid": "thanos@example.org"},
             mucnick="thanos",
         )
@@ -1939,7 +2050,7 @@ class ProcessingReactionTests(unittest.IsolatedAsyncioTestCase):
         await xmpp.on_processing_start(self._event(xmpp, authorized))
 
         self.assertEqual(fake_client.calls, [
-            ("room@muc.example.org", "muc2", ("👀",), "groupchat"),
+            ("room@muc.example.org", "muc2", ("👀",), "groupchat", " muc-thread "),
         ])
 
     async def test_failure_outcome_gets_cross_reaction(self):
@@ -2011,10 +2122,16 @@ class ThreadStanzaTests(unittest.IsolatedAsyncioTestCase):
         thin.client = FakeClient()
         thin.adapter = types.SimpleNamespace(settings=types.SimpleNamespace(send_chat_states=False))
 
-        await thin.send_message("thanos@example.org", "hi", "chat", thread_id="thread-123")
+        await thin.send_message(
+            "room@muc.example.org",
+            "hi",
+            "groupchat",
+            thread_id=" thread-123 ",
+        )
 
         self.assertEqual(len(thin.client.messages), 1)
-        self.assertEqual(thin.client.messages[0].values["thread"], "thread-123")
+        self.assertEqual(thin.client.messages[0].values["type"], "groupchat")
+        self.assertEqual(thin.client.messages[0].values["thread"], " thread-123 ")
         self.assertTrue(thin.client.messages[0].sent)
 
     async def test_send_message_omits_thread_when_thread_id_absent(self):

@@ -1610,7 +1610,7 @@ class XMPPAdapter(BasePlatformAdapter):
         message_type: str,
         thread_id: str | None,
     ) -> tuple[str, str, str | None]:
-        return _bare_jid(to_jid), message_type, thread_id
+        return _normalize_target(to_jid), message_type, thread_id
 
     async def _send_chat_state_transition(
         self,
