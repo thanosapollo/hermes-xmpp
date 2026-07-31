@@ -1043,11 +1043,14 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "XEP-0308"):
             await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
 
-    def test_adapter_does_not_advertise_generic_message_editing(self):
+    def test_adapter_disables_generic_editing_and_inherits_base_method(self):
+        xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))
+
         self.assertIs(
-            type(adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))).edit_message,
+            type(xmpp).edit_message,
             adapter.BasePlatformAdapter.edit_message,
         )
+        self.assertIs(xmpp.SUPPORTS_MESSAGE_EDITING, False)
 
     async def test_lifecycle_status_edits_existing_bubble_with_xep_0308(self):
         cfg = types.SimpleNamespace(extra={

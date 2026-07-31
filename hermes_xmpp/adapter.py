@@ -1173,6 +1173,7 @@ class XMPPAdapter(BasePlatformAdapter):
     """Hermes platform adapter for XMPP."""
 
     MEDIA_KINDS = _declared_media_kinds()
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: Any, **_: Any):
         try:
@@ -1418,7 +1419,9 @@ class XMPPAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Edit an adapter-owned lifecycle status with XEP-0308.
 
-        Generic ``edit_message`` stays inherited from ``BasePlatformAdapter``:
+        Generic ``edit_message`` stays inherited from ``BasePlatformAdapter``
+        and ``SUPPORTS_MESSAGE_EDITING`` is false: current Hermes has separate
+        capability and method-identity gates for streaming and tool progress.
         recipient-specific XEP-0308 support cannot honestly satisfy Hermes'
         platform-wide tool-progress editing contract. Lifecycle status routing
         can still probe the recipient, edit when supported, and fall back to a
