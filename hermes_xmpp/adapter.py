@@ -1173,7 +1173,6 @@ class XMPPAdapter(BasePlatformAdapter):
     """Hermes platform adapter for XMPP."""
 
     MEDIA_KINDS = _declared_media_kinds()
-    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: Any, **_: Any):
         try:
@@ -1284,12 +1283,6 @@ class XMPPAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
-        if (metadata or {}).get("expect_edits"):
-            return SendResult(
-                success=False,
-                error="XMPP does not support editable stream previews",
-                retryable=False,
-            )
         client = self._client
         if not self._client_is_connected():
             await self.on_xmpp_disconnected("send attempted while disconnected", client=client)
@@ -1423,9 +1416,9 @@ class XMPPAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Edit progress with XEP-0308 when the recipient advertises support.
 
-        Hermes uses the method override to enable tool progress, while the false
-        platform capability keeps generic streaming previews disabled. A
-        non-retryable unsupported result makes Hermes send fresh visible status.
+        Hermes uses this override for generic stream previews and tool progress.
+        A non-retryable unsupported result makes core fall back to fresh visible
+        delivery without sending an unprobed correction stanza.
         """
         client = self._client
         if not self._client_is_connected():

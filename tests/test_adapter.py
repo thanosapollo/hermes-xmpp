@@ -1063,16 +1063,16 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "XEP-0308"):
             await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
 
-    def test_adapter_overrides_edit_for_gateway_progress_without_streaming(self):
+    def test_adapter_enables_generic_gateway_edit_paths(self):
         xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))
 
         self.assertIsNot(
             type(xmpp).edit_message,
             adapter.BasePlatformAdapter.edit_message,
         )
-        self.assertIs(xmpp.SUPPORTS_MESSAGE_EDITING, False)
+        self.assertIs(getattr(xmpp, "SUPPORTS_MESSAGE_EDITING", True), True)
 
-    async def test_adapter_rejects_editable_preview_then_sends_one_full_final(self):
+    async def test_editable_preview_uses_bounded_core_fallback_when_edit_is_unsupported(self):
         xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))
 
         class FakeClient:
@@ -1083,6 +1083,9 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
                 self.messages.append(text)
                 return f"msg-{len(self.messages)}"
 
+            async def supports_message_correction(self, to_jid, message_type):
+                return False
+
         fake_client = FakeClient()
         xmpp._client = cast(Any, fake_client)
 
@@ -1091,12 +1094,18 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "partial",
             metadata={"expect_edits": True},
         )
+        edit = await xmpp.edit_message(
+            "thanos@example.org",
+            cast(str, preview.message_id),
+            "partial response",
+        )
         final = await xmpp.send("thanos@example.org", "complete final")
 
-        self.assertFalse(preview.success)
-        self.assertFalse(preview.retryable)
+        self.assertTrue(preview.success)
+        self.assertFalse(edit.success)
+        self.assertFalse(edit.retryable)
         self.assertTrue(final.success)
-        self.assertEqual(fake_client.messages, ["complete final"])
+        self.assertEqual(fake_client.messages, ["partial", "complete final"])
 
     async def test_lifecycle_status_edits_existing_bubble_with_xep_0308(self):
         cfg = types.SimpleNamespace(extra={
