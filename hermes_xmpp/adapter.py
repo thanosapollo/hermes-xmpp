@@ -1598,12 +1598,10 @@ class XMPPAdapter(BasePlatformAdapter):
         state: str,
         message_type: str,
         thread_id: str | None,
-        *,
-        refresh: bool = False,
     ) -> None:
         key = self._chat_state_key(to_jid, message_type, thread_id)
         async with self._chat_state_lock:
-            if not refresh and self._chat_states.get(key) == state:
+            if self._chat_states.get(key) == state:
                 return
             await client.send_chat_state(
                 to_jid,
@@ -1635,8 +1633,10 @@ class XMPPAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Send XEP-0085 ``composing`` for the active 1:1 conversation.
 
-        Hermes' base adapter calls this repeatedly while the LLM is working.
-        For XMPP, keep it DM-only and prefer the last full resource JID seen
+        Hermes' base adapter calls this repeatedly while the LLM is working,
+        but XEP-0085 forbids consecutive identical standalone notifications.
+        The transition owner suppresses those refresh ticks. Keep it DM-only
+        and prefer the last full resource JID seen
         from the user (e.g. Dino's ``user@example.org/dino``) over the bare JID,
         because chat state notifications are client/UI state rather than durable
         messages.
@@ -1662,7 +1662,6 @@ class XMPPAdapter(BasePlatformAdapter):
                 "composing",
                 message_type,
                 thread_id,
-                refresh=True,
             )
         except Exception as exc:
             if _is_connection_loss_exception(exc):

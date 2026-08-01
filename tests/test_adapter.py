@@ -644,7 +644,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("active", "thread-a"),
         ])
 
-    async def test_composing_refreshes_and_tracks_latest_full_resource(self):
+    async def test_composing_repetition_is_suppressed_per_full_resource(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
             "server": "chat.example.org",
@@ -671,8 +671,6 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake_client.calls, [
             ("thanos@example.org/dino", "composing", "thread-42"),
-            ("thanos@example.org/dino", "composing", "thread-42"),
-            ("thanos@example.org/cheogram", "composing", "thread-42"),
             ("thanos@example.org/cheogram", "composing", "thread-42"),
         ])
 
@@ -732,7 +730,6 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         await xmpp.stop_typing("thanos@example.org")
 
         self.assertEqual(fake_client.states, [
-            ("composing", " opaque thread "),
             ("composing", " opaque thread "),
         ])
 
@@ -799,7 +796,6 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(fake_client.states, [
-            ("composing", " opaque thread "),
             ("composing", " opaque thread "),
         ])
 
