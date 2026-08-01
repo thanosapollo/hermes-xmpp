@@ -1231,16 +1231,19 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeClient:
             def __init__(self):
+                self.probes = []
                 self.corrections = []
 
             async def supports_message_correction(self, to_jid, message_type):
+                self.probes.append((to_jid, message_type))
                 await asyncio.Event().wait()
 
             async def edit_message(self, *args, **kwargs):
                 self.corrections.append((args, kwargs))
 
         fake_client = FakeClient()
-        xmpp._client = fake_client
+        xmpp._client = cast(Any, fake_client)
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/emacs"
         xmpp._sent_text_by_message_id["status-1"] = "old"
 
         with patch.object(adapter, "_MESSAGE_CORRECTION_SUPPORT_TIMEOUT", 0.01, create=True):
@@ -1251,6 +1254,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.success)
         self.assertFalse(result.retryable)
+        self.assertEqual(fake_client.probes, [("thanos@example.org/emacs", "chat")])
         self.assertEqual(fake_client.corrections, [])
 
     async def test_correction_without_full_resource_falls_back_without_probe(self):
