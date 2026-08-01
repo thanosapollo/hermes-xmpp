@@ -545,7 +545,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("active", "thread-b"),
         ])
 
-    async def test_chat_state_dedup_distinguishes_full_resources(self):
+    async def test_composing_refreshes_and_tracks_latest_full_resource(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
             "server": "chat.example.org",
@@ -572,6 +572,8 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake_client.calls, [
             ("thanos@example.org/dino", "composing", "thread-42"),
+            ("thanos@example.org/dino", "composing", "thread-42"),
+            ("thanos@example.org/cheogram", "composing", "thread-42"),
             ("thanos@example.org/cheogram", "composing", "thread-42"),
         ])
 
@@ -673,7 +675,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "thanos@example.org",
             metadata={"thread_id": "thread-42"},
         )
-        result = await xmpp._edit_status_message(
+        result = await xmpp.edit_message(
             "thanos@example.org",
             "status-1",
             "new",
@@ -1043,10 +1045,10 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "XEP-0308"):
             await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
 
-    def test_adapter_disables_generic_editing_and_inherits_base_method(self):
+    def test_adapter_overrides_edit_for_gateway_progress_without_streaming(self):
         xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))
 
-        self.assertIs(
+        self.assertIsNot(
             type(xmpp).edit_message,
             adapter.BasePlatformAdapter.edit_message,
         )
@@ -1113,13 +1115,13 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "🔍 search_files...",
             metadata=thread_metadata,
         )
-        edit = await xmpp._edit_status_message(
+        edit = await xmpp.edit_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
             metadata=thread_metadata,
         )
-        duplicate = await xmpp._edit_status_message(
+        duplicate = await xmpp.edit_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
@@ -1163,7 +1165,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         xmpp._client = cast(Any, fake_client)
 
         first = await xmpp.send("thanos@example.org", "🔍 search_files...")
-        result = await xmpp._edit_status_message(
+        result = await xmpp.edit_message(
             chat_id="thanos@example.org",
             message_id=cast(str, first.message_id),
             content="🔍 search_files...\n📖 read_file...",
@@ -1418,7 +1420,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         xmpp._client = cast(Any, fake_client)
         xmpp._sent_text_by_message_id["muc-status-1"] = "old"
 
-        result = await xmpp._edit_status_message(
+        result = await xmpp.edit_message(
             "room@muc.example.org",
             "muc-status-1",
             "new",
@@ -2104,7 +2106,8 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         cfg = self._cfg()
         xmpp = adapter.XMPPAdapter(cfg)
 
-        with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(False, "emma@example.org:hermes")):
+        with patch.object(adapter, "check_requirements", return_value=True), \
+             patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(False, "emma@example.org:hermes")):
             ok = await xmpp.connect()
 
         self.assertFalse(ok)
@@ -2304,9 +2307,15 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(xmpp._lock_key)
 
     def test_acquire_lock_fails_open_without_status_module(self):
-        # In the unit-test environment gateway.status is not importable, so the
-        # lock helper must fail open and let the adapter proceed.
-        acquired, key = adapter._acquire_xmpp_identity_lock("emma@example.org", "hermes")
+        real_import = __import__
+
+        def import_without_status(name, *args, **kwargs):
+            if name == "gateway.status":
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_without_status):
+            acquired, key = adapter._acquire_xmpp_identity_lock("emma@example.org", "hermes")
         self.assertTrue(acquired)
         self.assertIsNone(key)
 

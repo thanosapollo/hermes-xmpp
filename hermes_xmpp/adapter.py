@@ -1390,7 +1390,7 @@ class XMPPAdapter(BasePlatformAdapter):
                 return await self.send(chat_id, content, metadata=metadata)
             cached_id = self._status_message_ids.get(key)
             if cached_id:
-                result = await self._edit_status_message(
+                result = await self.edit_message(
                     chat_id,
                     cached_id,
                     content,
@@ -1415,7 +1415,7 @@ class XMPPAdapter(BasePlatformAdapter):
                 self._status_message_ids[key] = str(result.message_id)
             return result
 
-    async def _edit_status_message(
+    async def edit_message(
         self,
         chat_id: str,
         message_id: str,
@@ -1423,15 +1423,11 @@ class XMPPAdapter(BasePlatformAdapter):
         metadata: Optional[dict[str, Any]] = None,
         **_: Any,
     ) -> SendResult:
-        """Edit an adapter-owned lifecycle status with XEP-0308.
+        """Edit progress with XEP-0308 when the recipient advertises support.
 
-        Generic ``edit_message`` stays inherited from ``BasePlatformAdapter``
-        and ``SUPPORTS_MESSAGE_EDITING`` is false: current Hermes has separate
-        capability and method-identity gates for streaming and tool progress.
-        recipient-specific XEP-0308 support cannot honestly satisfy Hermes'
-        platform-wide tool-progress editing contract. Lifecycle status routing
-        can still probe the recipient, edit when supported, and fall back to a
-        fresh visible status through ``send_or_update_status``.
+        Hermes uses the method override to enable tool progress, while the false
+        platform capability keeps generic streaming previews disabled. A
+        non-retryable unsupported result makes Hermes send fresh visible status.
         """
         client = self._client
         if not self._client_is_connected():
@@ -1483,6 +1479,7 @@ class XMPPAdapter(BasePlatformAdapter):
             if _is_connection_loss_exception(exc):
                 await self.on_xmpp_disconnected(exc, client=client)
             return SendResult(success=False, error=str(exc), retryable=True)
+
 
     def _message_type_for_target(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> tuple[str, str]:
         target = _normalize_target(chat_id)
@@ -1593,10 +1590,12 @@ class XMPPAdapter(BasePlatformAdapter):
         state: str,
         message_type: str,
         thread_id: str | None,
+        *,
+        refresh: bool = False,
     ) -> None:
         key = self._chat_state_key(to_jid, message_type, thread_id)
         async with self._chat_state_lock:
-            if self._chat_states.get(key) == state:
+            if not refresh and self._chat_states.get(key) == state:
                 return
             await client.send_chat_state(
                 to_jid,
@@ -1651,6 +1650,7 @@ class XMPPAdapter(BasePlatformAdapter):
                 "composing",
                 message_type,
                 thread_id,
+                refresh=True,
             )
         except Exception as exc:
             if _is_connection_loss_exception(exc):
