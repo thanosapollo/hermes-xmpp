@@ -545,6 +545,51 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("active", "thread-b"),
         ])
 
+    async def test_keep_typing_keeps_thread_context_across_wait_for_cleanup(self):
+        cfg = types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        })
+        xmpp = adapter.XMPPAdapter(cfg)
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_chat_state(self, to_jid, state, message_type="chat", *, thread_id=None):
+                self.calls.append((to_jid, state, thread_id))
+
+        async def base_keep_typing(
+            base_adapter,
+            chat_id,
+            interval=2.0,
+            metadata=None,
+            stop_event=None,
+        ):
+            await asyncio.wait_for(
+                base_adapter.send_typing(chat_id, metadata=metadata),
+                timeout=0.1,
+            )
+            await base_adapter.stop_typing(chat_id)
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/dino"
+
+        with patch.object(adapter.BasePlatformAdapter, "_keep_typing", base_keep_typing, create=True):
+            await asyncio.gather(
+                xmpp._keep_typing("thanos@example.org", metadata={"thread_id": "thread-a"}),
+                xmpp._keep_typing("thanos@example.org", metadata={"thread_id": "thread-b"}),
+            )
+
+        self.assertCountEqual(fake_client.calls, [
+            ("thanos@example.org/dino", "composing", "thread-a"),
+            ("thanos@example.org/dino", "active", "thread-a"),
+            ("thanos@example.org/dino", "composing", "thread-b"),
+            ("thanos@example.org/dino", "active", "thread-b"),
+        ])
+
     async def test_composing_refreshes_and_tracks_latest_full_resource(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
@@ -1062,6 +1107,97 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "XEP-0308"):
             await thin.edit_message("thanos@example.org", "msg-1", "📖 read_file...", "chat")
+
+    async def test_adapter_probes_and_corrects_last_full_dm_resource(self):
+        xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+        }))
+
+        class FakeClient:
+            def __init__(self):
+                self.probes = []
+                self.corrections = []
+
+            async def supports_message_correction(self, to_jid, message_type):
+                self.probes.append((to_jid, message_type))
+                return True
+
+            async def edit_message(
+                self,
+                to_jid,
+                message_id,
+                text,
+                message_type,
+                *,
+                thread_id=None,
+            ):
+                self.corrections.append((to_jid, message_id, text, message_type, thread_id))
+                return message_id
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        xmpp._sent_text_by_message_id["status-1"] = "old"
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/dino"
+
+        first = await xmpp.edit_message(
+            "thanos@example.org",
+            "status-1",
+            "first",
+            metadata={"thread_id": " opaque thread "},
+        )
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/cheogram"
+        second = await xmpp.edit_message(
+            "thanos@example.org",
+            "status-1",
+            "second",
+            metadata={"thread_id": " opaque thread "},
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(fake_client.probes, [
+            ("thanos@example.org/dino", "chat"),
+            ("thanos@example.org/cheogram", "chat"),
+        ])
+        self.assertEqual(fake_client.corrections, [
+            ("thanos@example.org/dino", "status-1", "first", "chat", " opaque thread "),
+            ("thanos@example.org/cheogram", "status-1", "second", "chat", " opaque thread "),
+        ])
+
+    async def test_hanging_correction_probe_falls_back_within_bound(self):
+        xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+        }))
+
+        class FakeClient:
+            def __init__(self):
+                self.corrections = []
+
+            async def supports_message_correction(self, to_jid, message_type):
+                await asyncio.Event().wait()
+
+            async def edit_message(self, *args, **kwargs):
+                self.corrections.append((args, kwargs))
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        xmpp._sent_text_by_message_id["status-1"] = "old"
+
+        with patch.object(adapter, "_MESSAGE_CORRECTION_SUPPORT_TIMEOUT", 0.01, create=True):
+            result = await asyncio.wait_for(
+                xmpp.edit_message("thanos@example.org", "status-1", "new"),
+                timeout=0.1,
+            )
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        self.assertEqual(fake_client.corrections, [])
 
     def test_adapter_enables_generic_gateway_edit_paths(self):
         xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))

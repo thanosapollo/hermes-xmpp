@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 AUDIO_EXTENSIONS = {".mp3", ".ogg", ".opus", ".wav", ".m4a", ".flac"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+_MESSAGE_CORRECTION_SUPPORT_TIMEOUT = 1.0
 
 try:
     from gateway.config import Platform
@@ -1349,7 +1350,10 @@ class XMPPAdapter(BasePlatformAdapter):
         try:
             supported = checker(target, message_type)
             if inspect.isawaitable(supported):
-                supported = await supported
+                supported = await asyncio.wait_for(
+                    supported,
+                    timeout=_MESSAGE_CORRECTION_SUPPORT_TIMEOUT,
+                )
             return bool(supported)
         except Exception:
             logger.debug("XMPP: message correction support check failed for %s", target, exc_info=True)
@@ -1427,6 +1431,10 @@ class XMPPAdapter(BasePlatformAdapter):
         if not self._message_text_changed(message_id, content):
             return SendResult(success=True, message_id=message_id)
         target, message_type = self._message_type_for_target(chat_id, metadata)
+        if message_type == "chat":
+            dm_target = self._chat_state_target(target)
+            if dm_target is not None:
+                target = dm_target[0]
         if not await self._supports_message_correction(target, message_type):
             return SendResult(
                 success=False,
@@ -1652,6 +1660,31 @@ class XMPPAdapter(BasePlatformAdapter):
                 await self.on_xmpp_disconnected(exc, client=client)
             else:
                 raise
+
+    async def _keep_typing(
+        self,
+        chat_id: str,
+        interval: float = 2.0,
+        metadata: dict[str, Any] | None = None,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        """Bind XEP-0201 thread context around Hermes' typing refresh task."""
+        thread_token = self._chat_state_thread.set(
+            _optional_thread_id((metadata or {}).get("thread_id")),
+        )
+        try:
+            keep_typing = getattr(super(), "_keep_typing", None)
+            if callable(keep_typing):
+                result = keep_typing(
+                    chat_id,
+                    interval=interval,
+                    metadata=metadata,
+                    stop_event=stop_event,
+                )
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            self._chat_state_thread.reset(thread_token)
 
     async def stop_typing(self, chat_id: str) -> None:
         """Send XEP-0085 ``active`` to clear the composing indicator."""
