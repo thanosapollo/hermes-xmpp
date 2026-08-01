@@ -29,6 +29,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 AUDIO_EXTENSIONS = {".mp3", ".ogg", ".opus", ".wav", ".m4a", ".flac"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _MESSAGE_CORRECTION_SUPPORT_TIMEOUT = 1.0
+_CHAT_STATE_UNOWNED = object()
 
 try:
     from gateway.config import Platform
@@ -1184,9 +1185,9 @@ class XMPPAdapter(BasePlatformAdapter):
         self.settings = XmppSettings.from_config(config)
         self._client: Optional[_SlixmppClient] = None
         self._last_full_jid_by_chat: dict[str, str] = {}
-        self._chat_state_thread: ContextVar[str | None] = ContextVar(
+        self._chat_state_thread: ContextVar[object] = ContextVar(
             "hermes_xmpp_chat_state_thread",
-            default=None,
+            default=_CHAT_STATE_UNOWNED,
         )
         self._chat_states: dict[tuple[str, str, str | None], str] = {}
         self._chat_state_lock = asyncio.Lock()
@@ -1432,9 +1433,17 @@ class XMPPAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         target, message_type = self._message_type_for_target(chat_id, metadata)
         if message_type == "chat":
-            dm_target = self._chat_state_target(target)
-            if dm_target is not None:
-                target = dm_target[0]
+            bare_target = _bare_jid(target)
+            if target == bare_target and bare_target not in self._last_full_jid_by_chat:
+                return SendResult(
+                    success=False,
+                    message_id=message_id,
+                    error="XMPP message editing requires a known recipient resource",
+                    retryable=False,
+                )
+            correction_target = self._chat_state_target(target)
+            if correction_target is not None:
+                target = correction_target[0]
         if not await self._supports_message_correction(target, message_type):
             return SendResult(
                 success=False,
@@ -1690,6 +1699,10 @@ class XMPPAdapter(BasePlatformAdapter):
         """Send XEP-0085 ``active`` to clear the composing indicator."""
         if not self.settings.send_chat_states:
             return
+        chat_state_owner = self._chat_state_thread.get()
+        if chat_state_owner is _CHAT_STATE_UNOWNED:
+            return
+        thread_id = chat_state_owner if isinstance(chat_state_owner, str) else None
         client = self._client
         if not self._client_is_connected():
             if client is not None:
@@ -1699,7 +1712,6 @@ class XMPPAdapter(BasePlatformAdapter):
         if target is None:
             return
         to_jid, message_type = target
-        thread_id = self._chat_state_thread.get()
         assert client is not None
         try:
             await self._send_chat_state_transition(

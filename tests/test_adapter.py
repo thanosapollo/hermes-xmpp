@@ -590,6 +590,60 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("thanos@example.org/dino", "active", "thread-b"),
         ])
 
+    async def test_unowned_interrupt_stop_cannot_emit_cross_thread_active(self):
+        xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        }))
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def send_chat_state(self, to_jid, state, message_type="chat", *, thread_id=None):
+                self.calls.append((state, thread_id))
+
+        started = asyncio.Event()
+
+        async def base_keep_typing(
+            base_adapter,
+            chat_id,
+            interval=2.0,
+            metadata=None,
+            stop_event=None,
+        ):
+            try:
+                await asyncio.wait_for(
+                    base_adapter.send_typing(chat_id, metadata=metadata),
+                    timeout=0.1,
+                )
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await base_adapter.stop_typing(chat_id)
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/dino"
+
+        with patch.object(adapter.BasePlatformAdapter, "_keep_typing", base_keep_typing, create=True):
+            typing_task = asyncio.create_task(xmpp._keep_typing(
+                "thanos@example.org",
+                metadata={"thread_id": "thread-a"},
+            ))
+            await started.wait()
+            await xmpp.stop_typing("thanos@example.org")
+            typing_task.cancel()
+            await typing_task
+
+        self.assertEqual(fake_client.calls, [
+            ("composing", "thread-a"),
+            ("active", "thread-a"),
+        ])
+
     async def test_composing_refreshes_and_tracks_latest_full_resource(self):
         cfg = types.SimpleNamespace(extra={
             "jid": "emma@example.org",
@@ -1199,6 +1253,37 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.retryable)
         self.assertEqual(fake_client.corrections, [])
 
+    async def test_correction_without_full_resource_falls_back_without_probe(self):
+        xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+            "progress_delivery": "edit",
+        }))
+
+        class FakeClient:
+            def __init__(self):
+                self.probes = []
+                self.corrections = []
+
+            async def supports_message_correction(self, to_jid, message_type):
+                self.probes.append((to_jid, message_type))
+                return True
+
+            async def edit_message(self, *args, **kwargs):
+                self.corrections.append((args, kwargs))
+
+        fake_client = FakeClient()
+        xmpp._client = fake_client
+        xmpp._sent_text_by_message_id["status-1"] = "old"
+
+        result = await xmpp.edit_message("thanos@example.org", "status-1", "new")
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        self.assertEqual(fake_client.probes, [])
+        self.assertEqual(fake_client.corrections, [])
+
     def test_adapter_enables_generic_gateway_edit_paths(self):
         xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={"jid": "emma@example.org", "server": "chat.example.org", "password": "secret"}))
 
@@ -1271,6 +1356,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         xmpp._client = cast(Any, fake_client)
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/emacs"
 
         thread_metadata = {"chat_type": "dm", "thread_id": " progress-thread "}
         first = await xmpp.send(
@@ -1298,7 +1384,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("thanos@example.org", "🔍 search_files...", "chat", " progress-thread ", None),
         ])
         self.assertEqual(fake_client.edits, [
-            ("thanos@example.org", cast(str, first.message_id), "🔍 search_files...\n📖 read_file...", "chat", " progress-thread "),
+            ("thanos@example.org/emacs", cast(str, first.message_id), "🔍 search_files...\n📖 read_file...", "chat", " progress-thread "),
         ])
 
     async def test_lifecycle_status_edit_unsupported_fails_without_extra_bubbles(self):
@@ -1326,6 +1412,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         xmpp._client = cast(Any, fake_client)
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/emacs"
 
         first = await xmpp.send("thanos@example.org", "🔍 search_files...")
         result = await xmpp.edit_message(
@@ -1401,6 +1488,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         xmpp._client = cast(Any, fake_client)
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/emacs"
 
         first = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Thinking…")
         second = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Still working…")
@@ -1414,7 +1502,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             ("thanos@example.org", "normal final reply", "chat", None, None),
         ])
         self.assertEqual(fake_client.edits, [
-            ("thanos@example.org", "msg-1", "Still working…", "chat"),
+            ("thanos@example.org/emacs", "msg-1", "Still working…", "chat"),
         ])
 
     async def test_status_bubbles_are_isolated_by_xmpp_thread(self):
@@ -1494,6 +1582,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         xmpp._client = cast(Any, fake_client)
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/emacs"
 
         first = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Thinking…")
         second = await xmpp.send_or_update_status("thanos@example.org", "lifecycle", "Still working…")
