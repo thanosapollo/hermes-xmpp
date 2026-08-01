@@ -164,7 +164,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(adapter.XmppSettings.from_config(cfg).progress_delivery, "messages")
 
         os.environ["XMPP_EDITABLE_PROGRESS"] = "force"
-        self.assertEqual(adapter.XmppSettings.from_config(cfg).editable_progress_policy, "force")
+        self.assertEqual(adapter.XmppSettings.from_config(cfg).editable_progress_policy, "known")
 
         os.environ["XMPP_PROGRESS_DELIVERY"] = "edit"
         self.assertEqual(adapter.XmppSettings.from_config(cfg).progress_delivery, "edit")
@@ -614,19 +614,28 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         xmpp._client = fake_client
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/dino"
 
         await xmpp.send_typing(
             "thanos@example.org",
-            metadata={"thread_id": "thread-42"},
+            metadata={"thread_id": " opaque thread "},
+        )
+        await xmpp.send_typing(
+            "thanos@example.org",
+            metadata={"thread_id": " opaque thread "},
         )
         await xmpp.send(
             "thanos@example.org",
             "done",
-            metadata={"thread_id": "thread-42"},
+            metadata={"thread_id": " opaque thread "},
         )
         await xmpp.stop_typing("thanos@example.org")
+        await xmpp.stop_typing("thanos@example.org")
 
-        self.assertEqual(fake_client.states, [("composing", "thread-42")])
+        self.assertEqual(fake_client.states, [
+            ("composing", " opaque thread "),
+            ("composing", " opaque thread "),
+        ])
 
     async def test_correction_active_state_suppresses_redundant_stop(self):
         cfg = types.SimpleNamespace(extra={
@@ -669,22 +678,31 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         xmpp._client = fake_client
+        xmpp._last_full_jid_by_chat["thanos@example.org"] = "thanos@example.org/dino"
         xmpp._sent_text_by_message_id["status-1"] = "old"
 
         await xmpp.send_typing(
             "thanos@example.org",
-            metadata={"thread_id": "thread-42"},
+            metadata={"thread_id": " opaque thread "},
+        )
+        await xmpp.send_typing(
+            "thanos@example.org",
+            metadata={"thread_id": " opaque thread "},
         )
         result = await xmpp.edit_message(
             "thanos@example.org",
             "status-1",
             "new",
-            metadata={"thread_id": "thread-42"},
+            metadata={"thread_id": " opaque thread "},
         )
+        await xmpp.stop_typing("thanos@example.org")
         await xmpp.stop_typing("thanos@example.org")
 
         self.assertTrue(result.success)
-        self.assertEqual(fake_client.states, [("composing", "thread-42")])
+        self.assertEqual(fake_client.states, [
+            ("composing", " opaque thread "),
+            ("composing", " opaque thread "),
+        ])
 
     async def test_adapter_puts_incoming_thread_on_message_source(self):
         cfg = types.SimpleNamespace(extra={
@@ -1309,18 +1327,21 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "server": "chat.example.org",
             "password": "secret",
             "progress_delivery": "edit",
+            "editable_progress": "force",
         })
         xmpp = adapter.XMPPAdapter(cfg)
 
         class FakeClient:
             def __init__(self):
                 self.messages = []
+                self.support_checks = 0
 
             async def send_message(self, to_jid, text, message_type, *, thread_id=None, oob_url=None):
                 self.messages.append((to_jid, text, message_type, thread_id, oob_url))
                 return f"msg-{len(self.messages)}"
 
             async def supports_message_correction(self, to_jid, message_type):
+                self.support_checks += 1
                 return False
 
             async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
@@ -1341,6 +1362,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "Still working…",
             "Still still working…",
         ])
+        self.assertEqual(fake_client.support_checks, 2)
 
     async def test_send_uses_chat_type_for_domains_that_only_substring_match_muc(self):
         cfg = types.SimpleNamespace(extra={
@@ -1404,13 +1426,16 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             "server": "chat.example.org",
             "password": "secret",
             "progress_delivery": "edit",
-            "editable_progress": "force",
+            "editable_progress": "known",
         })
         xmpp = adapter.XMPPAdapter(cfg)
 
         class FakeClient:
             def __init__(self):
                 self.edits = []
+
+            async def supports_message_correction(self, to_jid, message_type):
+                return True
 
             async def edit_message(self, to_jid, message_id, text, message_type, *, thread_id=None):
                 self.edits.append((to_jid, message_id, text, message_type, thread_id))

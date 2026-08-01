@@ -507,7 +507,7 @@ class XmppSettings:
             editable_progress_policy=_normalize_policy(
                 os.getenv("XMPP_EDITABLE_PROGRESS") or extra.get("editable_progress_policy", extra.get("editable_progress")),
                 "known",
-                {"known", "force", "disabled"},
+                {"known", "disabled"},
             ),
             progress_delivery=_normalize_policy(
                 os.getenv("XMPP_PROGRESS_DELIVERY") or extra.get("progress_delivery"),
@@ -1338,16 +1338,14 @@ class XMPPAdapter(BasePlatformAdapter):
         it.  Default XMPP progress delivery is therefore plain visible messages,
         matching Hermes' gateway fallback behavior across clients.  Operators
         can opt into editable XEP-0308 bubbles with ``XMPP_PROGRESS_DELIVERY=edit``;
-        then ``XMPP_EDITABLE_PROGRESS`` controls whether support is probed,
-        forced, or disabled.
+        then ``XMPP_EDITABLE_PROGRESS`` controls whether support is probed or
+        disabled.
         """
         if self.settings.progress_delivery != "edit":
             return False
         policy = self.settings.editable_progress_policy
         if policy == "disabled":
             return False
-        if policy == "force":
-            return True
         if not self._client_is_connected():
             return False
         client = self._client
@@ -1612,6 +1610,10 @@ class XMPPAdapter(BasePlatformAdapter):
         message_type: str,
         thread_id: str | None,
     ) -> None:
+        if message_type == "chat":
+            target = self._chat_state_target(to_jid)
+            if target is not None:
+                to_jid = target[0]
         key = self._chat_state_key(to_jid, message_type, thread_id)
         async with self._chat_state_lock:
             self._chat_states[key] = state
