@@ -30,6 +30,8 @@ AUDIO_EXTENSIONS = {".mp3", ".ogg", ".opus", ".wav", ".m4a", ".flac"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _MESSAGE_CORRECTION_SUPPORT_TIMEOUT = 1.0
 _CHAT_STATE_UNOWNED = object()
+DEFAULT_TEXT_CHUNK_LIMIT = 4000
+_SENT_TEXT_CACHE_LIMIT = 1024
 
 try:
     from gateway.config import Platform
@@ -364,7 +366,7 @@ class XmppSettings:
     reaction_start_choices: tuple[str, ...] = ("👀",)
     reaction_success_choices: tuple[str, ...] = ("✅",)
     reaction_failure_choices: tuple[str, ...] = ("❌",)
-    text_chunk_limit: int = 4000
+    text_chunk_limit: int = DEFAULT_TEXT_CHUNK_LIMIT
     editable_progress_policy: str = "known"
     progress_delivery: str = "messages"
 
@@ -505,7 +507,7 @@ class XmppSettings:
                     ("text_chunk_limit", "max_message_length"),
                 )
             )
-            or 4000,
+            or DEFAULT_TEXT_CHUNK_LIMIT,
             editable_progress_policy=_normalize_policy(
                 os.getenv("XMPP_EDITABLE_PROGRESS") or extra.get("editable_progress_policy", extra.get("editable_progress")),
                 "known",
@@ -792,6 +794,8 @@ def _env_enablement() -> Optional[dict[str, Any]]:
     server = os.getenv("XMPP_SERVER") or os.getenv("XMPP_HOST")
     if not (os.getenv("XMPP_JID") and server):
         return None
+    # Hermes merges enablement via pop(home_channel) then platform.extra.update(seed).
+    # Return flat operator keys (IRC/Google Chat shape), not nested {"extra": {...}}.
     extra = {
         "jid": os.getenv("XMPP_JID"),
         "server": server,
@@ -822,11 +826,16 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         "text_chunk_limit": _int_or_none(
             os.getenv("XMPP_TEXT_CHUNK_LIMIT") or os.getenv("XMPP_MAX_MESSAGE_LENGTH")
         )
-        or 4000,
+        or DEFAULT_TEXT_CHUNK_LIMIT,
+        "anonymous_muc_policy": os.getenv("XMPP_ANONYMOUS_MUC_POLICY") or "mention_only",
+        "tool_progress_bubble_limit": _int_or_none(
+            os.getenv("XMPP_TOOL_PROGRESS_BUBBLE_LIMIT")
+        ),
+        "editable_progress_policy": os.getenv("XMPP_EDITABLE_PROGRESS") or "known",
         "progress_delivery": os.getenv("XMPP_PROGRESS_DELIVERY") or "messages",
     }
     return {
-        "extra": extra,
+        **extra,
         "home_channel": {"chat_id": extra["home_chat"], "name": "XMPP Home"},
     }
 
@@ -910,7 +919,23 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         setattr(self.client, "use_starttls", True)
         setattr(self.client, "force_starttls", True)
         self.client.boundjid.resource = adapter.settings.resource
-        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0128", "xep_0184", "xep_0199", "xep_0308", "xep_0333", "xep_0334", "xep_0359", "xep_0363", "xep_0444"):
+        for plugin in (
+            "xep_0030",
+            "xep_0045",
+            "xep_0066",
+            "xep_0085",
+            "xep_0128",
+            "xep_0184",
+            "xep_0199",
+            "xep_0308",
+            "xep_0333",
+            "xep_0334",
+            "xep_0359",
+            "xep_0363",
+            "xep_0428",
+            "xep_0444",
+            "xep_0461",
+        ):
             try:
                 self.client.register_plugin(plugin)
             except Exception:
@@ -944,13 +969,25 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
                 return False
         return getattr(self.client, "transport", None) is not None or getattr(self.client, "socket", None) is not None
 
-    async def send_message(self, to_jid: str, text: str, message_type: str, *, thread_id: str | None = None, oob_url: str | None = None) -> str:
+    async def send_message(
+        self,
+        to_jid: str,
+        text: str,
+        message_type: str,
+        *,
+        thread_id: str | None = None,
+        oob_url: str | None = None,
+        reply_to: str | None = None,
+    ) -> str:
         message_id = f"hermes-{uuid.uuid4().hex}"
         msg = self.client.make_message(mto=to_jid, mbody=text, mtype=message_type)
         msg["id"] = message_id
         if thread_id:
             # XEP-0201 thread IDs are opaque and must round-trip unchanged.
             msg["thread"] = thread_id
+        if reply_to:
+            # XEP-0461 reply: attach only when Hermes supplies reply_to.
+            msg["reply"]["id"] = reply_to
         if self.adapter.settings.send_chat_states and message_type == "chat":
             # XEP-0085: advertise support and mark the conversation active on
             # normal replies. This mirrors client behavior expected by Dino and
@@ -1175,6 +1212,9 @@ class XMPPAdapter(BasePlatformAdapter):
     """Hermes platform adapter for XMPP."""
 
     MEDIA_KINDS = _declared_media_kinds()
+    # Hermes truncates oversized outbound text unless the platform advertises
+    # native splitting. XMPPAdapter.send already chunks via split_text_for_xmpp.
+    splits_long_messages = True
 
     def __init__(self, config: Any, **_: Any):
         try:
@@ -1245,7 +1285,7 @@ class XMPPAdapter(BasePlatformAdapter):
             self._client = None
             _release_xmpp_identity_lock(self._lock_key)
             self._lock_key = None
-            await self._clear_chat_states()
+            await self._clear_session_state()
             if client:
                 await client.disconnect()
         finally:
@@ -1274,7 +1314,7 @@ class XMPPAdapter(BasePlatformAdapter):
         self._client = None
         _release_xmpp_identity_lock(self._lock_key)
         self._lock_key = None
-        await self._clear_chat_states()
+        await self._clear_session_state()
         self._set_fatal_error("connection_lost", f"XMPP connection lost: {reason}", retryable=True)
         await self._notify_fatal_error()
 
@@ -1296,12 +1336,10 @@ class XMPPAdapter(BasePlatformAdapter):
         try:
             message_ids: list[str] = []
             for index, chunk in enumerate(split_text_for_xmpp(content, self.settings.text_chunk_limit)):
-                message_id = await client.send_message(
-                    target,
-                    chunk,
-                    message_type,
-                    thread_id=thread_id,
-                )
+                send_kwargs: dict[str, Any] = {"thread_id": thread_id}
+                if index == 0 and reply_to:
+                    send_kwargs["reply_to"] = reply_to
+                message_id = await client.send_message(target, chunk, message_type, **send_kwargs)
                 if self.settings.send_chat_states and message_type == "chat":
                     await self._remember_chat_state(
                         target,
@@ -1310,7 +1348,7 @@ class XMPPAdapter(BasePlatformAdapter):
                         thread_id,
                     )
                 message_ids.append(message_id)
-                self._sent_text_by_message_id[message_id] = chunk
+                self._remember_sent_text(message_id, chunk)
             return SendResult(
                 success=True,
                 message_id=message_ids[-1] if message_ids else None,
@@ -1324,6 +1362,12 @@ class XMPPAdapter(BasePlatformAdapter):
     def _message_text_changed(self, message_id: str, content: str) -> bool:
         previous = self._sent_text_by_message_id.get(message_id, "")
         return str(previous or "") != str(content or "")
+
+    def _remember_sent_text(self, message_id: str, content: str) -> None:
+        self._sent_text_by_message_id.pop(message_id, None)
+        self._sent_text_by_message_id[message_id] = str(content or "")
+        while len(self._sent_text_by_message_id) > _SENT_TEXT_CACHE_LIMIT:
+            self._sent_text_by_message_id.pop(next(iter(self._sent_text_by_message_id)))
 
     async def _supports_message_correction(self, target: str, message_type: str) -> bool:
         """Return True only when editable progress is explicitly safe.
@@ -1476,7 +1520,7 @@ class XMPPAdapter(BasePlatformAdapter):
                     message_type,
                     thread_id,
                 )
-            self._sent_text_by_message_id[message_id] = str(content or "")
+            self._remember_sent_text(message_id, content)
             return SendResult(success=True, message_id=message_id)
         except RuntimeError as exc:
             if _is_connection_loss_exception(exc):
@@ -1518,7 +1562,10 @@ class XMPPAdapter(BasePlatformAdapter):
         try:
             url = await client.upload_file(str(path), detected_type)
             text = f"{caption}\n{url}" if caption else url
-            message_id = await client.send_message(target, text, message_type, thread_id=thread_id, oob_url=url)
+            send_kwargs: dict[str, Any] = {"thread_id": thread_id, "oob_url": url}
+            if reply_to:
+                send_kwargs["reply_to"] = reply_to
+            message_id = await client.send_message(target, text, message_type, **send_kwargs)
             if self.settings.send_chat_states and message_type == "chat":
                 await self._remember_chat_state(target, "active", message_type, thread_id)
             return SendResult(success=True, message_id=message_id, raw_response={"url": url, "content_type": detected_type})
@@ -1629,6 +1676,12 @@ class XMPPAdapter(BasePlatformAdapter):
     async def _clear_chat_states(self) -> None:
         async with self._chat_state_lock:
             self._chat_states.clear()
+
+    async def _clear_session_state(self) -> None:
+        await self._clear_chat_states()
+        self._status_message_ids.clear()
+        self._sent_text_by_message_id.clear()
+        self._last_full_jid_by_chat.clear()
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Send XEP-0085 ``composing`` for the active 1:1 conversation.
@@ -1978,7 +2031,7 @@ def register(ctx: Any) -> None:
         standalone_sender_fn=_standalone_send,
         allowed_users_env="XMPP_ALLOWED_USERS",
         allow_all_env="XMPP_ALLOW_ALL_USERS",
-        max_message_length=4000,
+        max_message_length=DEFAULT_TEXT_CHUNK_LIMIT,
         pii_safe=False,
         allow_update_command=True,
         platform_hint=(
