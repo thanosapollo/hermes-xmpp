@@ -253,6 +253,64 @@ class AuthorizationTests(unittest.TestCase):
         self.assertFalse(xmpp._authorized_group_message("friend@example.org", "hi", room_jid="room@conference.example.org"))
         self.assertFalse(xmpp._authorized_group_message("friend@example.org", "Emma: hi", room_jid="other@conference.example.org"))
 
+    def test_group_policy_allowlist_empty_allowed_rooms_denies_all_rooms(self):
+        """Fail closed: allowlist + empty effective room set authorizes no room JID."""
+        for empty in ([], set(), ""):
+            with self.subTest(empty=empty):
+                xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={
+                    "jid": "emma@example.org",
+                    "server": "s",
+                    "password": "p",
+                    "nickname": "Emma",
+                    "group_policy": "allowlist",
+                    "rooms": ["joined@conference.example.org"],
+                    "allowed_rooms": empty,
+                    "group_allow_from": ["*@example.org"],
+                    "muc_require_mention": True,
+                }))
+                self.assertEqual(xmpp.settings.allowed_rooms, set())
+                self.assertFalse(
+                    xmpp._authorized_group_message(
+                        "friend@example.org",
+                        "Emma: hi",
+                        room_jid="joined@conference.example.org",
+                    )
+                )
+                self.assertFalse(
+                    xmpp._authorized_group_message(
+                        "friend@example.org",
+                        "Emma: hi",
+                        room_jid="evil@conference.example.org",
+                    )
+                )
+
+    def test_group_policy_allowlist_omitted_allowed_rooms_defaults_from_rooms(self):
+        xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={
+            "jid": "emma@example.org",
+            "server": "s",
+            "password": "p",
+            "nickname": "Emma",
+            "group_policy": "allowlist",
+            "rooms": ["joined@conference.example.org"],
+            "group_allow_from": ["*@example.org"],
+            "muc_require_mention": True,
+        }))
+        self.assertEqual(xmpp.settings.allowed_rooms, {"joined@conference.example.org"})
+        self.assertTrue(
+            xmpp._authorized_group_message(
+                "friend@example.org",
+                "Emma: hi",
+                room_jid="joined@conference.example.org",
+            )
+        )
+        self.assertFalse(
+            xmpp._authorized_group_message(
+                "friend@example.org",
+                "Emma: hi",
+                room_jid="evil@conference.example.org",
+            )
+        )
+
     def test_anonymous_muc_policy_respects_sender_identity_and_mention_gate(self):
         def authorized(policy, sender, text):
             xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={

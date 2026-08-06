@@ -405,11 +405,14 @@ class XmppSettings:
                 os.getenv("XMPP_GROUP_ALLOW_FROM") or extra.get("group_allow_from", [])
             )
         }
+        if "XMPP_ALLOWED_ROOMS" in os.environ:
+            allowed_room_values = os.environ.get("XMPP_ALLOWED_ROOMS")
+        elif "allowed_rooms" in extra:
+            allowed_room_values = extra.get("allowed_rooms")
+        else:
+            allowed_room_values = room_values
         allowed_rooms = {
-            _bare_jid(room)
-            for room in _split_csv(
-                os.getenv("XMPP_ALLOWED_ROOMS") or extra.get("allowed_rooms", room_values)
-            )
+            _bare_jid(room) for room in _split_csv(allowed_room_values)
         }
         return cls(
             jid=jid,
@@ -728,8 +731,11 @@ def _authorized_direct_message(settings: XmppSettings, bare_sender_jid: str) -> 
 def _authorized_group_message(settings: XmppSettings, bare_sender_jid: str, text: str, room_jid: str | None = None) -> bool:
     if settings.group_policy == "disabled":
         return False
-    if room_jid and settings.group_policy == "allowlist" and settings.allowed_rooms and _bare_jid(room_jid) not in settings.allowed_rooms:
-        return False
+    if room_jid and settings.group_policy == "allowlist":
+        # Fail closed: empty/None effective allowlist denies every room JID.
+        allowed_rooms = settings.allowed_rooms or set()
+        if _bare_jid(room_jid) not in allowed_rooms:
+            return False
     if settings.group_allow_from and not _matches_jid(bare_sender_jid, settings.group_allow_from):
         return False
     if settings.anonymous_muc_policy == "deny" and "@" not in bare_sender_jid:
@@ -807,7 +813,6 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         "rooms": _split_csv(os.getenv("XMPP_ROOMS") or os.getenv("XMPP_MUC_ROOMS")),
         "allowed_users": _split_csv(os.getenv("XMPP_ALLOWED_USERS")),
         "group_allow_from": _split_csv(os.getenv("XMPP_GROUP_ALLOW_FROM")),
-        "allowed_rooms": _split_csv(os.getenv("XMPP_ALLOWED_ROOMS")),
         "allow_all_users": _truthy(os.getenv("XMPP_ALLOW_ALL_USERS")),
         "dm_policy": os.getenv("XMPP_DM_POLICY") or "allowlist",
         "group_policy": os.getenv("XMPP_GROUP_POLICY") or "allowlist",
@@ -834,6 +839,10 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         "editable_progress_policy": os.getenv("XMPP_EDITABLE_PROGRESS") or "known",
         "progress_delivery": os.getenv("XMPP_PROGRESS_DELIVERY") or "messages",
     }
+    # Only seed allowed_rooms when explicitly set. Unset must omit the key so
+    # from_config can fall back to joined rooms after Hermes merges the seed.
+    if "XMPP_ALLOWED_ROOMS" in os.environ:
+        extra["allowed_rooms"] = _split_csv(os.environ.get("XMPP_ALLOWED_ROOMS"))
     return {
         **extra,
         "home_channel": {"chat_id": extra["home_chat"], "name": "XMPP Home"},

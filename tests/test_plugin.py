@@ -85,6 +85,57 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(platform_extra["tool_progress_bubble_limit"], 17)
         self.assertEqual(platform_extra["editable_progress_policy"], "disabled")
 
+    def test_env_enablement_omits_allowed_rooms_when_unset_so_rooms_fallback_survives_merge(self):
+        """Unset XMPP_ALLOWED_ROOMS must not seed empty list that blocks rooms fallback."""
+        os.environ["XMPP_JID"] = "bot@example.org"
+        os.environ["XMPP_SERVER"] = "chat.example.org"
+        os.environ["XMPP_PASSWORD"] = "secret"
+        os.environ["XMPP_ROOMS"] = "room@muc.example.org"
+        os.environ["XMPP_GROUP_POLICY"] = "allowlist"
+        os.environ["XMPP_GROUP_ALLOW_FROM"] = "*@example.org"
+        os.environ["XMPP_NICKNAME"] = "Bot"
+
+        enabled = adapter._env_enablement()
+        if enabled is None:
+            self.fail("expected env enablement")
+        self.assertNotIn("allowed_rooms", enabled)
+
+        seed = dict(enabled)
+        seed.pop("home_channel")
+        platform_extra = {}
+        platform_extra.update(seed)
+        settings = adapter.XmppSettings.from_config(types.SimpleNamespace(extra=platform_extra))
+        self.assertEqual(settings.allowed_rooms, {"room@muc.example.org"})
+        self.assertTrue(
+            adapter._authorized_group_message(
+                settings,
+                "friend@example.org",
+                "Bot: hi",
+                room_jid="room@muc.example.org",
+            )
+        )
+
+        os.environ["XMPP_ALLOWED_ROOMS"] = ""
+        enabled_empty = adapter._env_enablement()
+        if enabled_empty is None:
+            self.fail("expected env enablement with empty allowed rooms")
+        self.assertIn("allowed_rooms", enabled_empty)
+        self.assertEqual(enabled_empty["allowed_rooms"], [])
+        seed_empty = dict(enabled_empty)
+        seed_empty.pop("home_channel")
+        settings_empty = adapter.XmppSettings.from_config(
+            types.SimpleNamespace(extra=dict(seed_empty))
+        )
+        self.assertEqual(settings_empty.allowed_rooms, set())
+        self.assertFalse(
+            adapter._authorized_group_message(
+                settings_empty,
+                "friend@example.org",
+                "Bot: hi",
+                room_jid="room@muc.example.org",
+            )
+        )
+
     def test_standalone_sender_reports_unconfigured_without_crashing(self):
         cfg = types.SimpleNamespace(extra={})
         result = asyncio.run(adapter._standalone_send(cfg, "user@example.org", "hello"))
