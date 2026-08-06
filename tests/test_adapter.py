@@ -2474,6 +2474,7 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_acquires_lock_then_proceeds(self):
         cfg = self._cfg()
         xmpp = adapter.XMPPAdapter(cfg)
+        mark_calls = []
 
         class FakeThinClient:
             def __init__(self, _adapter):
@@ -2482,13 +2483,53 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
             async def connect(self):
                 return True
 
+        def mark_connected():
+            mark_calls.append("connected")
+
+        xmpp._mark_connected = mark_connected
+
         with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
              patch.object(adapter, "_SlixmppClient", FakeThinClient), \
-             patch.object(adapter, "check_requirements", return_value=True):
+             patch.object(adapter, "check_requirements", return_value=True), \
+             patch.object(adapter, "_release_xmpp_identity_lock") as release:
             ok = await xmpp.connect()
 
         self.assertTrue(ok)
+        self.assertIsInstance(xmpp._client, FakeThinClient)
         self.assertEqual(xmpp._lock_key, "emma@example.org:hermes")
+        self.assertEqual(mark_calls, ["connected"])
+        release.assert_not_called()
+
+    async def test_connect_false_return_drops_client_and_releases_lock(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        mark_calls = []
+        built = []
+
+        class FalseThinClient:
+            def __init__(self, _adapter):
+                built.append(self)
+
+            async def connect(self):
+                return False
+
+        def mark_connected():
+            mark_calls.append("connected")
+
+        xmpp._mark_connected = mark_connected
+
+        with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
+             patch.object(adapter, "_SlixmppClient", FalseThinClient), \
+             patch.object(adapter, "check_requirements", return_value=True), \
+             patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            ok = await xmpp.connect()
+
+        self.assertFalse(ok)
+        self.assertEqual(len(built), 1)
+        self.assertIsNone(xmpp._client)
+        self.assertIsNone(xmpp._lock_key)
+        self.assertEqual(mark_calls, [])
+        release.assert_called_once_with("emma@example.org:hermes")
 
     async def test_connect_accepts_gateway_reconnect_keyword(self):
         cfg = self._cfg()
@@ -2656,6 +2697,7 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_failure_releases_lock(self):
         cfg = self._cfg()
         xmpp = adapter.XMPPAdapter(cfg)
+        mark_calls = []
 
         class FailingThinClient:
             def __init__(self, _adapter):
@@ -2664,15 +2706,24 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
             async def connect(self):
                 raise RuntimeError("connection refused")
 
+        def mark_connected():
+            mark_calls.append("connected")
+
+        xmpp._mark_connected = mark_connected
+
         with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
              patch.object(adapter, "_SlixmppClient", FailingThinClient), \
-             patch.object(adapter, "check_requirements", return_value=True):
+             patch.object(adapter, "check_requirements", return_value=True), \
+             patch.object(adapter, "_release_xmpp_identity_lock") as release:
             ok = await xmpp.connect()
 
         self.assertFalse(ok)
         self.assertIsNone(xmpp._client)
         # Lock must be released so a retry is not blocked by a stale lock.
         self.assertIsNone(xmpp._lock_key)
+        self.assertEqual(mark_calls, [])
+        release.assert_called_once_with("emma@example.org:hermes")
+        self.assertEqual(xmpp.fatal_error_message, "connection refused")
 
     def test_acquire_lock_fails_open_without_status_module(self):
         real_import = __import__

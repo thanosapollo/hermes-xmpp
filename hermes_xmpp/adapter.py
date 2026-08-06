@@ -1283,6 +1283,12 @@ class XMPPAdapter(BasePlatformAdapter):
             _release_xmpp_identity_lock(self._lock_key)
             self._lock_key = None
             return False
+        if not ok:
+            # Literal false return: never publish connected; drop client and lock.
+            self._client = None
+            _release_xmpp_identity_lock(self._lock_key)
+            self._lock_key = None
+            return False
         self._mark_connected()
         return ok
 
