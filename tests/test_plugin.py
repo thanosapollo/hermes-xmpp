@@ -112,6 +112,7 @@ class PluginRegistrationTests(unittest.TestCase):
                 "friend@example.org",
                 "Bot: hi",
                 room_jid="room@muc.example.org",
+                sender_authenticated=True,
             )
         )
 
@@ -133,6 +134,7 @@ class PluginRegistrationTests(unittest.TestCase):
                 "friend@example.org",
                 "Bot: hi",
                 room_jid="room@muc.example.org",
+                sender_authenticated=True,
             )
         )
 

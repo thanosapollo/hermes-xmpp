@@ -29,6 +29,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 AUDIO_EXTENSIONS = {".mp3", ".ogg", ".opus", ".wav", ".m4a", ".flac"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _MESSAGE_CORRECTION_SUPPORT_TIMEOUT = 1.0
+_FAILED_CONNECT_TEARDOWN_TIMEOUT = 2.0
 _CHAT_STATE_UNOWNED = object()
 DEFAULT_TEXT_CHUNK_LIMIT = 4000
 _SENT_TEXT_CACHE_LIMIT = 1024
@@ -555,6 +556,7 @@ class ParsedXmppMessage:
     wants_chat_marker: bool = False
     marker_id: str = ""
     is_marker_or_receipt: bool = False
+    user_id_authenticated: bool = False
 
 
 @dataclass(frozen=True)
@@ -650,16 +652,25 @@ def _marker_reference_id(msg: Any, fallback: str) -> str:
     return fallback
 
 
-def _group_sender_id(msg: Any, raw_from: str) -> tuple[str, str]:
+def _group_sender_id(msg: Any, raw_from: str) -> tuple[str, str, bool]:
     nick = ""
     try:
         nick = str(msg.get_mucnick() or "")
     except Exception:
         if "/" in raw_from:
             nick = raw_from.split("/", 1)[1]
-    muc = getattr(msg, "muc", {}) or {}
-    sender_jid = _bare_jid(str(muc.get("jid", "") if isinstance(muc, dict) else "") or nick)
-    return sender_jid, nick
+    try:
+        muc = msg.get_plugin("muc", check=True)
+    except (AttributeError, TypeError):
+        # Lightweight mapping-style messages are used by pure parser tests.
+        muc = _msg_get(msg, "muc", None)
+    sender_jid = ""
+    if muc is not None:
+        try:
+            sender_jid = _bare_jid(str(muc["jid"] or ""))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+    return sender_jid or nick, nick, bool(sender_jid)
 
 
 def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | None:
@@ -680,7 +691,7 @@ def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | 
     is_marker_or_receipt = _message_has_marker_or_receipt(msg)
 
     if msg_type == "groupchat":
-        sender_jid, nick = _group_sender_id(msg, raw_from)
+        sender_jid, nick, sender_authenticated = _group_sender_id(msg, raw_from)
         return ParsedXmppMessage(
             text=text,
             raw_from=raw_from,
@@ -698,6 +709,7 @@ def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | 
             wants_chat_marker=wants_chat_marker,
             marker_id=_marker_reference_id(msg, message_id),
             is_marker_or_receipt=is_marker_or_receipt,
+            user_id_authenticated=sender_authenticated,
         )
 
     return ParsedXmppMessage(
@@ -728,7 +740,14 @@ def _authorized_direct_message(settings: XmppSettings, bare_sender_jid: str) -> 
     return _matches_jid(bare_sender_jid, settings.allowed_users)
 
 
-def _authorized_group_message(settings: XmppSettings, bare_sender_jid: str, text: str, room_jid: str | None = None) -> bool:
+def _authorized_group_message(
+    settings: XmppSettings,
+    bare_sender_jid: str,
+    text: str,
+    room_jid: str | None = None,
+    *,
+    sender_authenticated: bool = False,
+) -> bool:
     if settings.group_policy == "disabled":
         return False
     if room_jid and settings.group_policy == "allowlist":
@@ -736,9 +755,12 @@ def _authorized_group_message(settings: XmppSettings, bare_sender_jid: str, text
         allowed_rooms = settings.allowed_rooms or set()
         if _bare_jid(room_jid) not in allowed_rooms:
             return False
-    if settings.group_allow_from and not _matches_jid(bare_sender_jid, settings.group_allow_from):
+    if settings.group_allow_from and (
+        not sender_authenticated
+        or not _matches_jid(bare_sender_jid, settings.group_allow_from)
+    ):
         return False
-    if settings.anonymous_muc_policy == "deny" and "@" not in bare_sender_jid:
+    if settings.anonymous_muc_policy == "deny" and not sender_authenticated:
         return False
     if settings.muc_require_mention:
         normalized = text.lower().lstrip()
@@ -756,7 +778,13 @@ def authorized_xmpp_message(parsed: ParsedXmppMessage, settings: XmppSettings) -
     if parsed.chat_type == "group":
         if parsed.user_id in {_bare_jid(settings.jid), settings.nickname.lower()}:
             return False
-        return _authorized_group_message(settings, parsed.user_id, parsed.text, room_jid=parsed.chat_id)
+        return _authorized_group_message(
+            settings,
+            parsed.user_id,
+            parsed.text,
+            room_jid=parsed.chat_id,
+            sender_authenticated=parsed.user_id_authenticated,
+        )
     if parsed.from_jid == _bare_jid(settings.jid):
         return False
     return _authorized_direct_message(settings, parsed.from_jid)
@@ -921,39 +949,56 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         import slixmpp
 
         class Client(slixmpp.ClientXMPP):
-            pass
+            async def _handle_stream_features(self, features: Any) -> bool | None:
+                offered = features["features"]
+                if (
+                    "mechanisms" in offered
+                    and "starttls" not in offered
+                    and "starttls" not in self.features
+                ):
+                    self.disconnect(wait=0, reason="STARTTLS required before authentication")
+                    return True
+                return await super()._handle_stream_features(features)
 
         self.adapter = adapter
         self.client = Client(adapter.settings.jid, adapter.settings.password)
-        setattr(self.client, "use_starttls", True)
-        setattr(self.client, "force_starttls", True)
-        self.client.boundjid.resource = adapter.settings.resource
-        for plugin in (
-            "xep_0030",
-            "xep_0045",
-            "xep_0066",
-            "xep_0085",
-            "xep_0128",
-            "xep_0184",
-            "xep_0199",
-            "xep_0308",
-            "xep_0333",
-            "xep_0334",
-            "xep_0359",
-            "xep_0363",
-            "xep_0428",
-            "xep_0444",
-            "xep_0461",
-        ):
+        try:
+            self.client.enable_starttls = True
+            self.client.enable_direct_tls = False
+            self.client.enable_plaintext = False
+            self.client.boundjid.resource = adapter.settings.resource
+            for plugin in (
+                "xep_0030",
+                "xep_0045",
+                "xep_0066",
+                "xep_0085",
+                "xep_0128",
+                "xep_0184",
+                "xep_0199",
+                "xep_0308",
+                "xep_0333",
+                "xep_0334",
+                "xep_0359",
+                "xep_0363",
+                "xep_0428",
+                "xep_0444",
+                "xep_0461",
+            ):
+                try:
+                    self.client.register_plugin(plugin)
+                except Exception:
+                    logger.debug("XMPP plugin %s unavailable", plugin, exc_info=True)
+            self.client.add_event_handler("session_start", self._on_session_start)
+            self.client.add_event_handler("message", self._on_message)
+            disconnected_handler = self._on_disconnected
+            self.client.add_event_handler("session_end", disconnected_handler)
+            self.client.add_event_handler("disconnected", disconnected_handler)
+        except Exception:
             try:
-                self.client.register_plugin(plugin)
+                self.client.abort()
             except Exception:
-                logger.debug("XMPP plugin %s unavailable", plugin, exc_info=True)
-        self.client.add_event_handler("session_start", self._on_session_start)
-        self.client.add_event_handler("message", self._on_message)
-        disconnected_handler = self._on_disconnected
-        self.client.add_event_handler("session_end", disconnected_handler)
-        self.client.add_event_handler("disconnected", disconnected_handler)
+                logger.debug("XMPP: failed aborting partially constructed client", exc_info=True)
+            raise
 
     async def connect(self) -> bool:
         address = self.adapter.settings.connect_address()
@@ -967,6 +1012,9 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
 
     async def disconnect(self) -> None:
         await self.client.disconnect()
+
+    def abort(self) -> None:
+        self.client.abort()
 
     def is_connected(self) -> bool:
         checker = getattr(self.client, "is_connected", None)
@@ -1254,6 +1302,91 @@ class XMPPAdapter(BasePlatformAdapter):
     def enforces_own_access_policy(self) -> bool:
         return True
 
+    @staticmethod
+    def _abort_connect_client(client: Any) -> None:
+        abort = getattr(client, "abort", None)
+        if not callable(abort):
+            return
+        try:
+            abort()
+        except Exception:
+            logger.debug("XMPP: failed aborting unsuccessful connection", exc_info=True)
+
+    async def _bounded_connect_teardown(self, client: Any) -> None:
+        disconnect = getattr(client, "disconnect", None)
+        if not callable(disconnect):
+            self._abort_connect_client(client)
+            return
+        try:
+            result = disconnect()
+        except Exception:
+            self._abort_connect_client(client)
+            return
+        if not inspect.isawaitable(result):
+            return
+
+        disconnect_task = asyncio.ensure_future(result)
+        done, _ = await asyncio.wait(
+            {disconnect_task},
+            timeout=_FAILED_CONNECT_TEARDOWN_TIMEOUT,
+        )
+        if disconnect_task in done:
+            try:
+                disconnect_task.result()
+                return
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("XMPP: unsuccessful connection teardown failed", exc_info=True)
+        else:
+            disconnect_task.cancel()
+            logger.warning("XMPP: unsuccessful connection teardown timed out; aborting transport")
+
+        self._abort_connect_client(client)
+        await asyncio.sleep(0)
+        if disconnect_task.done():
+            self._consume_teardown_result(disconnect_task)
+        else:
+            disconnect_task.add_done_callback(self._consume_teardown_result)
+
+    @staticmethod
+    def _consume_teardown_result(task: asyncio.Future[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("XMPP: late unsuccessful connection teardown failed", exc_info=True)
+
+    async def _cleanup_connect_attempt(self, client: Any, lock_key: str | None) -> None:
+        owns_attempt = self._client is client
+        if client is None:
+            owns_attempt = self._client is None and self._lock_key == lock_key
+        release_key = None
+        if owns_attempt:
+            self._client = None
+            release_key = lock_key if self._lock_key == lock_key else None
+            if release_key is not None:
+                self._lock_key = None
+        try:
+            if client is not None:
+                await self._bounded_connect_teardown(client)
+        finally:
+            if release_key is not None:
+                _release_xmpp_identity_lock(release_key)
+
+    async def _finish_connect_cleanup(self, client: Any, lock_key: str | None) -> None:
+        cleanup_task = asyncio.create_task(self._cleanup_connect_attempt(client, lock_key))
+        cancelled = False
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Hermes core passes ``is_reconnect`` on startup/retry. XMPP does not need
         # different queue semantics, but accepting it keeps the adapter contract
@@ -1273,21 +1406,21 @@ class XMPPAdapter(BasePlatformAdapter):
             return False
         self._lock_key = lock_key
 
-        self._client = _SlixmppClient(self)
+        client: _SlixmppClient | None = None
         try:
-            ok = await self._client.connect()
+            client = _SlixmppClient(self)
+            self._client = client
+            ok = await client.connect()
+        except asyncio.CancelledError:
+            await self._finish_connect_cleanup(client, lock_key)
+            raise
         except Exception as exc:
             logger.error("XMPP: failed to connect as %s: %s", self.settings.jid, exc)
             self._set_fatal_error("connect_failed", str(exc), retryable=True)
-            self._client = None
-            _release_xmpp_identity_lock(self._lock_key)
-            self._lock_key = None
+            await self._finish_connect_cleanup(client, lock_key)
             return False
         if not ok:
-            # Literal false return: never publish connected; drop client and lock.
-            self._client = None
-            _release_xmpp_identity_lock(self._lock_key)
-            self._lock_key = None
+            await self._finish_connect_cleanup(client, lock_key)
             return False
         self._mark_connected()
         return ok
@@ -1955,8 +2088,21 @@ class XMPPAdapter(BasePlatformAdapter):
     def _authorized_direct_message(self, bare_sender_jid: str) -> bool:
         return _authorized_direct_message(self.settings, bare_sender_jid)
 
-    def _authorized_group_message(self, bare_sender_jid: str, text: str, room_jid: str | None = None) -> bool:
-        return _authorized_group_message(self.settings, bare_sender_jid, text, room_jid=room_jid)
+    def _authorized_group_message(
+        self,
+        bare_sender_jid: str,
+        text: str,
+        room_jid: str | None = None,
+        *,
+        sender_authenticated: bool = False,
+    ) -> bool:
+        return _authorized_group_message(
+            self.settings,
+            bare_sender_jid,
+            text,
+            room_jid=room_jid,
+            sender_authenticated=sender_authenticated,
+        )
 
     def _strip_muc_mention(self, text: str) -> str:
         return _strip_muc_mention(text, self.settings.nickname)

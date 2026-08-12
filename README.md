@@ -28,7 +28,7 @@ This repository keeps the adapter in `hermes_xmpp/adapter.py`. For local Hermes 
 
 - Hermes Agent with plugin support.
 - Python 3.11+.
-- `slixmpp>=1.9,<2` available to the same Python environment that runs Hermes.
+- `slixmpp>=1.10,<2` available to the same Python environment that runs Hermes.
 - An XMPP account for the bot.
 
 ### Install as a local Hermes plugin
@@ -55,7 +55,7 @@ hermes plugins enable xmpp-platform
 Install the Python dependency in the Hermes runtime environment. For a venv-based Hermes install:
 
 ```sh
-python -m pip install 'slixmpp>=1.9,<2'
+python -m pip install 'slixmpp>=1.10,<2'
 ```
 
 For a Nix-packaged Hermes install, do not `pip install` into the immutable store. Add `slixmpp` to the Hermes wrapper/package environment declaratively, then rebuild the profile or Home Manager generation that provides `hermes`.

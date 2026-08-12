@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Emma Apollo", email = "emma@thanosapollo.org" }]
 dependencies = [
-  "slixmpp>=1.9,<2",
+  "slixmpp>=1.10,<2",
 ]
 
 [project.optional-dependencies]

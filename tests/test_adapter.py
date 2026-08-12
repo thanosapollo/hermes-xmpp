@@ -248,10 +248,10 @@ class AuthorizationTests(unittest.TestCase):
             "group_allow_from": ["*@example.org"],
             "muc_require_mention": True,
         }))
-        self.assertTrue(xmpp._authorized_group_message("friend@example.org", "Emma: hi", room_jid="room@conference.example.org"))
-        self.assertFalse(xmpp._authorized_group_message("friend@evil.org", "Emma: hi", room_jid="room@conference.example.org"))
-        self.assertFalse(xmpp._authorized_group_message("friend@example.org", "hi", room_jid="room@conference.example.org"))
-        self.assertFalse(xmpp._authorized_group_message("friend@example.org", "Emma: hi", room_jid="other@conference.example.org"))
+        self.assertTrue(xmpp._authorized_group_message("friend@example.org", "Emma: hi", room_jid="room@conference.example.org", sender_authenticated=True))
+        self.assertFalse(xmpp._authorized_group_message("friend@evil.org", "Emma: hi", room_jid="room@conference.example.org", sender_authenticated=True))
+        self.assertFalse(xmpp._authorized_group_message("friend@example.org", "hi", room_jid="room@conference.example.org", sender_authenticated=True))
+        self.assertFalse(xmpp._authorized_group_message("friend@example.org", "Emma: hi", room_jid="other@conference.example.org", sender_authenticated=True))
 
     def test_group_policy_allowlist_empty_allowed_rooms_denies_all_rooms(self):
         """Fail closed: allowlist + empty effective room set authorizes no room JID."""
@@ -274,6 +274,7 @@ class AuthorizationTests(unittest.TestCase):
                         "friend@example.org",
                         "Emma: hi",
                         room_jid="joined@conference.example.org",
+                        sender_authenticated=True,
                     )
                 )
                 self.assertFalse(
@@ -281,6 +282,7 @@ class AuthorizationTests(unittest.TestCase):
                         "friend@example.org",
                         "Emma: hi",
                         room_jid="evil@conference.example.org",
+                        sender_authenticated=True,
                     )
                 )
 
@@ -301,6 +303,7 @@ class AuthorizationTests(unittest.TestCase):
                 "friend@example.org",
                 "Emma: hi",
                 room_jid="joined@conference.example.org",
+                sender_authenticated=True,
             )
         )
         self.assertFalse(
@@ -308,11 +311,12 @@ class AuthorizationTests(unittest.TestCase):
                 "friend@example.org",
                 "Emma: hi",
                 room_jid="evil@conference.example.org",
+                sender_authenticated=True,
             )
         )
 
     def test_anonymous_muc_policy_respects_sender_identity_and_mention_gate(self):
-        def authorized(policy, sender, text):
+        def authorized(policy, sender, text, *, authenticated=False):
             xmpp = adapter.XMPPAdapter(types.SimpleNamespace(extra={
                 "jid": "emma@example.org",
                 "server": "s",
@@ -322,14 +326,32 @@ class AuthorizationTests(unittest.TestCase):
                 "anonymous_muc_policy": policy,
                 "muc_require_mention": True,
             }))
-            return xmpp._authorized_group_message(sender, text)
+            return xmpp._authorized_group_message(
+                sender,
+                text,
+                sender_authenticated=authenticated,
+            )
 
         self.assertFalse(authorized("deny", "guest", "Emma: hi"))
-        self.assertTrue(authorized("deny", "guest@example.org", "Emma: hi"))
+        self.assertTrue(
+            authorized(
+                "deny",
+                "guest@example.org",
+                "Emma: hi",
+                authenticated=True,
+            )
+        )
         for policy in ("allow", "mention_only"):
             self.assertFalse(authorized(policy, "guest", "hi"))
             self.assertTrue(authorized(policy, "guest", "Emma: hi"))
-            self.assertTrue(authorized(policy, "guest@example.org", "Emma: hi"))
+            self.assertTrue(
+                authorized(
+                    policy,
+                    "guest@example.org",
+                    "Emma: hi",
+                    authenticated=True,
+                )
+            )
 
 
 class FakeMessage:
@@ -348,6 +370,33 @@ class FakeMessage:
 
     def get_child(self, name, namespace=None):
         return self.values.get((namespace, name))
+
+
+def real_slix_muc_message(*, nick, item_jid=None):
+    from slixmpp import Message
+    from slixmpp.plugins.xep_0045.stanza import MUCMessage, MUCUserItem
+    from slixmpp.plugins.xep_0184.stanza import Received as DeliveryReceipt
+    from slixmpp.plugins.xep_0184.stanza import Request
+    from slixmpp.plugins.xep_0333.stanza import Acknowledged, Displayed, Markable, Received
+    from slixmpp.xmlstream import ET, register_stanza_plugin
+
+    register_stanza_plugin(MUCMessage, MUCUserItem)
+    register_stanza_plugin(Message, MUCMessage)
+    for stanza in (Request, DeliveryReceipt, Markable, Received, Displayed, Acknowledged):
+        register_stanza_plugin(Message, stanza)
+    xml = ET.Element(
+        "{jabber:client}message",
+        {
+            "from": f"room@muc.example.org/{nick}",
+            "type": "groupchat",
+            "id": "muc-auth",
+        },
+    )
+    ET.SubElement(xml, "{jabber:client}body").text = "Emma: hello"
+    muc = ET.SubElement(xml, "{http://jabber.org/protocol/muc#user}x")
+    if item_jid is not None:
+        ET.SubElement(muc, "{http://jabber.org/protocol/muc#user}item", {"jid": item_jid})
+    return Message(xml=xml)
 
 
 class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
@@ -383,6 +432,81 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed.receipt_target, "thanos@example.org/dino")
         self.assertTrue(adapter.authorized_xmpp_message(parsed, settings))
         self.assertEqual(adapter.event_text_for(parsed, settings), "hello")
+
+    def test_real_muc_item_jid_denies_allowlisted_looking_spoofed_nick(self):
+        settings = self._settings(
+            group_policy="open",
+            group_allow_from=["thanos@example.org"],
+            muc_require_mention=True,
+        )
+        parsed = adapter.parse_xmpp_message(
+            real_slix_muc_message(
+                nick="thanos@example.org",
+                item_jid="attacker@evil.example",
+            ),
+            settings,
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.user_id, "attacker@evil.example")
+        self.assertFalse(adapter.authorized_xmpp_message(parsed, settings))
+
+    def test_real_muc_item_jid_allows_authenticated_allowlisted_sender(self):
+        settings = self._settings(
+            group_policy="open",
+            group_allow_from=["thanos@example.org"],
+            muc_require_mention=True,
+        )
+        parsed = adapter.parse_xmpp_message(
+            real_slix_muc_message(
+                nick="anonymous-looking-nick",
+                item_jid="thanos@example.org/resource",
+            ),
+            settings,
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.user_id, "thanos@example.org")
+        self.assertTrue(adapter.authorized_xmpp_message(parsed, settings))
+
+    def test_real_muc_without_item_jid_follows_anonymous_policy(self):
+        msg = real_slix_muc_message(nick="thanos@example.org")
+        deny_settings = self._settings(
+            group_policy="open",
+            anonymous_muc_policy="deny",
+            muc_require_mention=True,
+        )
+        mention_settings = self._settings(
+            group_policy="open",
+            anonymous_muc_policy="mention_only",
+            muc_require_mention=True,
+        )
+
+        denied = adapter.parse_xmpp_message(msg, deny_settings)
+        allowed = adapter.parse_xmpp_message(msg, mention_settings)
+
+        self.assertIsNotNone(denied)
+        self.assertIsNotNone(allowed)
+        self.assertFalse(adapter.authorized_xmpp_message(denied, deny_settings))
+        self.assertTrue(adapter.authorized_xmpp_message(allowed, mention_settings))
+
+    def test_real_muc_with_malformed_item_jid_follows_anonymous_policy(self):
+        settings = self._settings(
+            group_policy="open",
+            anonymous_muc_policy="deny",
+            muc_require_mention=True,
+        )
+
+        parsed = adapter.parse_xmpp_message(
+            real_slix_muc_message(
+                nick="thanos@example.org",
+                item_jid="not a jid",
+            ),
+            settings,
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertFalse(adapter.authorized_xmpp_message(parsed, settings))
 
     def test_parse_preserves_xep_0201_thread(self):
         settings = self._settings()
@@ -915,8 +1039,9 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
                 self.password = password
                 self.boundjid = types.SimpleNamespace(resource="")
                 self.plugin = {}
-                self.use_starttls = False
-                self.force_starttls = False
+                self.enable_starttls = False
+                self.enable_direct_tls = True
+                self.enable_plaintext = True
 
             def register_plugin(self, plugin):
                 self.plugin[plugin] = object()
@@ -937,9 +1062,134 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             thin = adapter._SlixmppClient(xmpp)
 
         client = cast(Any, thin.client)
-        self.assertTrue(client.use_starttls)
-        self.assertTrue(client.force_starttls)
+        self.assertTrue(client.enable_starttls)
+        self.assertFalse(client.enable_direct_tls)
+        self.assertFalse(client.enable_plaintext)
         self.assertIn("xep_0461", client.plugin)
+
+    async def test_slixmpp_client_uses_configured_host_and_port(self):
+        import inspect
+
+        import slixmpp
+
+        inspect.signature(slixmpp.ClientXMPP.connect).bind(
+            object(),
+            host="chat.example.org",
+            port=5222,
+        )
+        calls = []
+
+        class FakeClient:
+            async def connect(self, *, host=None, port=None):
+                calls.append((host, port))
+
+            async def wait_until(self, event, timeout=None):
+                calls.append((event, timeout))
+
+        thin = cast(Any, object.__new__(adapter._SlixmppClient))
+        thin.adapter = types.SimpleNamespace(
+            settings=types.SimpleNamespace(connect_address=lambda: ("chat.example.org", 5222))
+        )
+        thin.client = FakeClient()
+
+        self.assertTrue(await thin.connect())
+        self.assertEqual(calls, [("chat.example.org", 5222), ("session_start", 20)])
+
+    async def test_slixmpp_without_starttls_rejects_every_sasl_offer(self):
+        from slixmpp.stanza import StreamFeatures
+        from slixmpp.xmlstream import ET
+
+        offers = (
+            ("ANONYMOUS",),
+            ("EXTERNAL",),
+            ("EXTERNAL", "SCRAM-SHA-1"),
+        )
+        for mechanisms in offers:
+            with self.subTest(mechanisms=mechanisms):
+                cfg = types.SimpleNamespace(extra={
+                    "jid": "bot@example.org",
+                    "server": "chat.example.org",
+                    "password": "secret",
+                })
+                thin = adapter._SlixmppClient(adapter.XMPPAdapter(cfg))
+                client = cast(Any, thin.client)
+                sent = []
+                disconnects = []
+
+                def send(data, use_filters=True, *, captured=sent):
+                    captured.append(type(data).__name__)
+
+                client.send = send
+
+                def disconnect(*args, captured=disconnects, **kwargs):
+                    captured.append((args, kwargs))
+                    future = asyncio.get_running_loop().create_future()
+                    future.set_result(None)
+                    return future
+
+                client.disconnect = disconnect
+                mechanism_xml = "".join(
+                    f"<mechanism>{mechanism}</mechanism>"
+                    for mechanism in mechanisms
+                )
+                xml = ET.fromstring(
+                    "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>"
+                    "<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>"
+                    f"{mechanism_xml}"
+                    "</mechanisms>"
+                    "</stream:features>"
+                )
+                features = StreamFeatures(xml=xml, stream=client)
+
+                try:
+                    await client._handle_stream_features(features)
+                    self.assertEqual(sent, [])
+                    self.assertEqual(len(disconnects), 1)
+                finally:
+                    client.abort()
+
+    async def test_slixmpp_allows_sasl_after_starttls_negotiation(self):
+        from slixmpp.stanza import StreamFeatures
+        from slixmpp.xmlstream import ET
+
+        cfg = types.SimpleNamespace(extra={
+            "jid": "bot@example.org",
+            "server": "chat.example.org",
+            "password": "secret",
+        })
+        thin = adapter._SlixmppClient(adapter.XMPPAdapter(cfg))
+        client = cast(Any, thin.client)
+        client.features.add("starttls")
+        sent = []
+        disconnects = []
+
+        def send(data, use_filters=True):
+            sent.append(type(data).__name__)
+
+        client.send = send
+
+        def disconnect(*args, **kwargs):
+            disconnects.append((args, kwargs))
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(None)
+            return future
+
+        client.disconnect = disconnect
+        xml = ET.fromstring(
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>"
+            "<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>"
+            "<mechanism>SCRAM-SHA-1</mechanism>"
+            "</mechanisms>"
+            "</stream:features>"
+        )
+        features = StreamFeatures(xml=xml, stream=client)
+
+        try:
+            await client._handle_stream_features(features)
+            self.assertIn("Auth", sent)
+            self.assertEqual(disconnects, [])
+        finally:
+            client.abort()
 
     def test_slixmpp_client_registers_disconnect_lifecycle_handlers(self):
         class FakeClientXMPP:
@@ -2508,10 +2758,14 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
 
         class FalseThinClient:
             def __init__(self, _adapter):
+                self.disconnect_calls = 0
                 built.append(self)
 
             async def connect(self):
                 return False
+
+            async def disconnect(self):
+                self.disconnect_calls += 1
 
         def mark_connected():
             mark_calls.append("connected")
@@ -2529,7 +2783,109 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(xmpp._client)
         self.assertIsNone(xmpp._lock_key)
         self.assertEqual(mark_calls, [])
+        self.assertEqual(built[0].disconnect_calls, 1)
         release.assert_called_once_with("emma@example.org:hermes")
+
+    async def test_connect_constructor_failure_aborts_partial_client_and_releases_lock(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        built = []
+
+        class FakeClientXMPP:
+            def __init__(self, jid, password):
+                self.boundjid = types.SimpleNamespace(resource="")
+                self.plugin = {}
+                self.abort_calls = 0
+                built.append(self)
+
+            def register_plugin(self, plugin):
+                self.plugin[plugin] = object()
+
+            def add_event_handler(self, *_args, **_kwargs):
+                raise RuntimeError("handler registration failed")
+
+            def abort(self):
+                self.abort_calls += 1
+
+        with patch.dict(sys.modules, {"slixmpp": types.SimpleNamespace(ClientXMPP=FakeClientXMPP)}), \
+             patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
+             patch.object(adapter, "check_requirements", return_value=True), \
+             patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            ok = await xmpp.connect()
+
+        self.assertFalse(ok)
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0].abort_calls, 1)
+        self.assertIsNone(xmpp._client)
+        self.assertIsNone(xmpp._lock_key)
+        release.assert_called_once_with("emma@example.org:hermes")
+
+    async def test_connect_cancellation_boundedly_tears_down_and_releases_lock(self):
+        cfg = self._cfg()
+        xmpp = adapter.XMPPAdapter(cfg)
+        connect_started = asyncio.Event()
+        disconnect_started = asyncio.Event()
+        disconnect_cancelled = asyncio.Event()
+        abort_calls = []
+
+        class HangingThinClient:
+            async def connect(self):
+                connect_started.set()
+                await asyncio.Event().wait()
+                return True
+
+            async def disconnect(self):
+                disconnect_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    disconnect_cancelled.set()
+
+            def abort(self):
+                abort_calls.append("abort")
+
+        with patch.object(adapter, "_acquire_xmpp_identity_lock", return_value=(True, "emma@example.org:hermes")), \
+             patch.object(adapter, "_SlixmppClient", return_value=HangingThinClient()), \
+             patch.object(adapter, "check_requirements", return_value=True), \
+             patch.object(adapter, "_FAILED_CONNECT_TEARDOWN_TIMEOUT", 0.01, create=True), \
+             patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            connect_task = asyncio.create_task(xmpp.connect())
+            await asyncio.wait_for(connect_started.wait(), 1)
+            connect_task.cancel()
+            await asyncio.wait_for(disconnect_started.wait(), 1)
+            connect_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(connect_task, 1)
+
+        self.assertTrue(disconnect_started.is_set())
+        self.assertTrue(disconnect_cancelled.is_set())
+        self.assertEqual(abort_calls, ["abort"])
+        self.assertIsNone(xmpp._client)
+        self.assertIsNone(xmpp._lock_key)
+        release.assert_called_once_with("emma@example.org:hermes")
+
+    async def test_stale_connect_cleanup_does_not_release_replacement_ownership(self):
+        xmpp = adapter.XMPPAdapter(self._cfg())
+
+        class OldClient:
+            def __init__(self):
+                self.disconnect_calls = 0
+
+            async def disconnect(self):
+                self.disconnect_calls += 1
+
+        old_client = OldClient()
+        replacement_client = object()
+        xmpp._client = cast(Any, replacement_client)
+        xmpp._lock_key = "emma@example.org:hermes"
+
+        with patch.object(adapter, "_release_xmpp_identity_lock") as release:
+            await xmpp._cleanup_connect_attempt(old_client, "emma@example.org:hermes")
+
+        self.assertIs(xmpp._client, replacement_client)
+        self.assertEqual(xmpp._lock_key, "emma@example.org:hermes")
+        self.assertEqual(old_client.disconnect_calls, 1)
+        release.assert_not_called()
 
     async def test_connect_accepts_gateway_reconnect_keyword(self):
         cfg = self._cfg()
