@@ -695,8 +695,8 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         await xmpp.stop_typing("thanos@example.org")
 
         self.assertEqual(fake_client.calls, [
-            ("composing", "thanos@example.org/dino", "chat", " thread-42 "),
-            ("active", "thanos@example.org/dino", "chat", " thread-42 "),
+            ("composing", "thanos@example.org", "chat", " thread-42 "),
+            ("active", "thanos@example.org", "chat", " thread-42 "),
         ])
 
     async def test_concurrent_thread_chat_states_keep_task_ownership(self):
@@ -786,10 +786,10 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertCountEqual(fake_client.calls, [
-            ("thanos@example.org/dino", "composing", "thread-a"),
-            ("thanos@example.org/dino", "active", "thread-a"),
-            ("thanos@example.org/dino", "composing", "thread-b"),
-            ("thanos@example.org/dino", "active", "thread-b"),
+            ("thanos@example.org", "composing", "thread-a"),
+            ("thanos@example.org", "active", "thread-a"),
+            ("thanos@example.org", "composing", "thread-b"),
+            ("thanos@example.org", "active", "thread-b"),
         ])
 
     async def test_unowned_interrupt_stop_cannot_emit_cross_thread_active(self):
@@ -872,8 +872,7 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
         await xmpp.send_typing("thanos@example.org", metadata={"thread_id": "thread-42"})
 
         self.assertEqual(fake_client.calls, [
-            ("thanos@example.org/dino", "composing", "thread-42"),
-            ("thanos@example.org/cheogram", "composing", "thread-42"),
+            ("thanos@example.org", "composing", "thread-42"),
         ])
 
     async def test_body_reply_active_state_suppresses_redundant_stop(self):

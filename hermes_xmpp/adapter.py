@@ -1778,6 +1778,12 @@ class XMPPAdapter(BasePlatformAdapter):
             return None
         return self._last_full_jid_by_chat.get(_bare_jid(target), target), "chat"
 
+    def _typing_target(self, chat_id: str) -> tuple[str, str] | None:
+        target = _normalize_target(chat_id)
+        if not target or _is_group_jid(target):
+            return None
+        return _bare_jid(target), "chat"
+
     def _chat_state_key(
         self,
         to_jid: str,
@@ -1814,9 +1820,7 @@ class XMPPAdapter(BasePlatformAdapter):
         thread_id: str | None,
     ) -> None:
         if message_type == "chat":
-            target = self._chat_state_target(to_jid)
-            if target is not None:
-                to_jid = target[0]
+            to_jid = _bare_jid(to_jid)
         key = self._chat_state_key(to_jid, message_type, thread_id)
         async with self._chat_state_lock:
             self._chat_states[key] = state
@@ -1837,10 +1841,8 @@ class XMPPAdapter(BasePlatformAdapter):
         Hermes' base adapter calls this repeatedly while the LLM is working,
         but XEP-0085 forbids consecutive identical standalone notifications.
         The transition owner suppresses those refresh ticks. Keep it DM-only
-        and prefer the last full resource JID seen
-        from the user (e.g. Dino's ``user@example.org/dino``) over the bare JID,
-        because chat state notifications are client/UI state rather than durable
-        messages.
+        and address the bare JID so every resource (Nema, emacs-jabber,
+        Conversations) receives the same composing/active notification.
         """
         if not self.settings.send_chat_states:
             return
@@ -1849,7 +1851,7 @@ class XMPPAdapter(BasePlatformAdapter):
             if client is not None:
                 await self.on_xmpp_disconnected("chat-state send attempted while disconnected", client=client)
             return
-        target = self._chat_state_target(chat_id)
+        target = self._typing_target(chat_id)
         if target is None:
             return
         to_jid, message_type = target
@@ -1908,7 +1910,7 @@ class XMPPAdapter(BasePlatformAdapter):
             if client is not None:
                 await self.on_xmpp_disconnected("chat-state send attempted while disconnected", client=client)
             return
-        target = self._chat_state_target(chat_id)
+        target = self._typing_target(chat_id)
         if target is None:
             return
         to_jid, message_type = target
