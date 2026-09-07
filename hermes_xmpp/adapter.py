@@ -576,6 +576,10 @@ class XmppReactionTarget:
 
 
 def _stanza_bool(msg: Any, key: str, namespace: str, name: str) -> bool:
+    # SDK plugin indexing lazily creates absent extensions. Inspect wire XML first.
+    xml = getattr(msg, "xml", None)
+    if xml is not None:
+        return xml.find(f"{{{namespace}}}{name}") is not None
     value = _msg_get(msg, key, None)
     if isinstance(value, bool):
         return value
@@ -604,6 +608,10 @@ def _stanza_bool(msg: Any, key: str, namespace: str, name: str) -> bool:
 
 
 def _stanza_id(msg: Any, key: str, namespace: str, name: str) -> str:
+    xml = getattr(msg, "xml", None)
+    if xml is not None:
+        child = xml.find(f"{{{namespace}}}{name}")
+        return str(child.get("id", "")).strip() if child is not None else ""
     value = _msg_get(msg, key, None)
     if isinstance(value, str):
         return value
@@ -674,6 +682,9 @@ def _group_sender_id(msg: Any, raw_from: str) -> tuple[str, str, bool]:
 
 
 def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | None:
+    msg_type = str(_msg_get(msg, "type", "chat") or "chat")
+    if msg_type not in {"normal", "chat", "groupchat"}:
+        return None
     text = str(_msg_get(msg, "body", "") or "").strip()
     links = _extract_oob_links(msg)
     if links:
@@ -683,7 +694,6 @@ def parse_xmpp_message(msg: Any, settings: XmppSettings) -> ParsedXmppMessage | 
 
     raw_from = str(_msg_get(msg, "from", "") or "")
     from_jid = _bare_jid(raw_from)
-    msg_type = str(_msg_get(msg, "type", "chat") or "chat")
     message_id = _extract_message_id(msg)
     thread_id = str(_msg_get(msg, "thread", "") or "")
     wants_delivery_receipt = _message_requests_delivery_receipt(msg)
@@ -776,7 +786,8 @@ def _strip_muc_mention(text: str, nickname: str) -> str:
 
 def authorized_xmpp_message(parsed: ParsedXmppMessage, settings: XmppSettings) -> bool:
     if parsed.chat_type == "group":
-        if parsed.user_id in {_bare_jid(settings.jid), settings.nickname.lower()}:
+        if (parsed.user_name == settings.nickname
+                or (parsed.user_id_authenticated and parsed.user_id == _bare_jid(settings.jid))):
             return False
         return _authorized_group_message(
             settings,
@@ -966,6 +977,7 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
             self.client.enable_starttls = True
             self.client.enable_direct_tls = False
             self.client.enable_plaintext = False
+            self.client.requested_jid.resource = adapter.settings.resource
             self.client.boundjid.resource = adapter.settings.resource
             for plugin in (
                 "xep_0030",
@@ -985,9 +997,19 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
                 "xep_0461",
             ):
                 try:
-                    self.client.register_plugin(plugin)
+                    if plugin == "xep_0184":
+                        # Only the adapter may acknowledge authorized messages.
+                        self.client.register_plugin(plugin, pconfig={"auto_ack": False})
+                    else:
+                        self.client.register_plugin(plugin)
                 except Exception:
                     logger.debug("XMPP plugin %s unavailable", plugin, exc_info=True)
+            from slixmpp.xmlstream.handler import CoroutineCallback
+            from slixmpp.xmlstream.matcher import StanzaPath
+
+            self.client.register_handler(CoroutineCallback(
+                "Hermes OOB", StanzaPath("message/oob"), self._on_oob_message,
+            ))
             self.client.add_event_handler("session_start", self._on_session_start)
             self.client.add_event_handler("message", self._on_message)
             disconnected_handler = self._on_disconnected
@@ -1011,9 +1033,18 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
         return True
 
     async def disconnect(self) -> None:
-        await self.client.disconnect()
+        # SDK disconnect/abort skip retry cancellation when no transport exists.
+        attempt = self.client._current_connection_attempt
+        self.client.cancel_connection_attempt()
+        try:
+            if attempt is not None:
+                await asyncio.gather(attempt, return_exceptions=True)
+            await self.client.disconnect()
+        finally:
+            self.abort()
 
     def abort(self) -> None:
+        self.client.cancel_connection_attempt()
         self.client.abort()
 
     def is_connected(self) -> bool:
@@ -1208,6 +1239,11 @@ class _SlixmppClient:  # pragma: no cover - live protocol path
                 continue
             await _join_muc_room(muc, room, self.adapter.settings.nickname)
 
+    async def _on_oob_message(self, msg: Any) -> None:
+        # The SDK IM handler owns every message with a body, even an empty one.
+        if msg.xml.find("{jabber:client}body") is None:
+            await self._on_message(msg)
+
     async def _on_message(self, msg: Any) -> None:
         await self.adapter.on_xmpp_message(msg)
 
@@ -1229,6 +1265,10 @@ def _msg_get(msg: Any, key: str, default: Any = "") -> Any:
 
 
 def _extract_oob_links(msg: Any) -> list[str]:
+    xml = getattr(msg, "xml", None)
+    if xml is not None:
+        return [url.text.strip() for url in xml.findall("{jabber:x:oob}x/{jabber:x:oob}url")
+                if url.text and url.text.strip()]
     links: list[str] = []
     try:
         oob = msg.get_child("x", namespace="jabber:x:oob") or msg.get_child("x", "jabber:x:oob")
@@ -1242,6 +1282,10 @@ def _extract_oob_links(msg: Any) -> list[str]:
 
 
 def _extract_message_id(msg: Any) -> str:
+    xml = getattr(msg, "xml", None)
+    if xml is not None:
+        # Receipt/reaction references use the message ID, not arbitrary XEP-0359 IDs.
+        return str(xml.get("id", "")).strip()
     for key in ("id", "origin-id", "stanza-id"):
         value = str(_msg_get(msg, key, "") or "").strip()
         if value:
@@ -1297,6 +1341,16 @@ class XMPPAdapter(BasePlatformAdapter):
     @property
     def name(self) -> str:
         return "XMPP"
+
+    @property
+    def _dm_policy(self) -> str:
+        if self.settings.dm_policy == "disabled":
+            return "disabled"
+        return "open" if self.settings.allow_all_users else self.settings.dm_policy
+
+    @property
+    def _group_policy(self) -> str:
+        return self.settings.group_policy
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -1633,9 +1687,8 @@ class XMPPAdapter(BasePlatformAdapter):
                     error="XMPP message editing requires a known recipient resource",
                     retryable=False,
                 )
-            correction_target = self._chat_state_target(target)
-            if correction_target is not None:
-                target = correction_target[0]
+            if target == bare_target:
+                target = self._last_full_jid_by_chat[bare_target]
         if not await self._supports_message_correction(target, message_type):
             return SendResult(
                 success=False,
@@ -1929,6 +1982,19 @@ class XMPPAdapter(BasePlatformAdapter):
             else:
                 raise
 
+    def _gateway_allows_side_effect(self, user_id: str, chat_type: str,
+                                   chat_id: str, thread_id: str | None = None) -> bool:
+        # Older cores/standalone adapters have no registered host check. Once
+        # registered, only an explicit grant permits credentialed side effects.
+        if getattr(self, "_authorization_check", None) is None:
+            return True
+        try:
+            kwargs = {"thread_id": thread_id} if thread_id is not None else {}
+            return self._is_sender_authorized(user_id, chat_type, chat_id, **kwargs) is True
+        except Exception:
+            logger.debug("XMPP: gateway authorization check failed", exc_info=True)
+            return False
+
     def _reaction_target_for_event(self, event: MessageEvent) -> XmppReactionTarget | None:
         if not self.settings.reactions_enabled:
             return None
@@ -1937,7 +2003,9 @@ class XMPPAdapter(BasePlatformAdapter):
             parsed = parse_xmpp_message(raw_message, self.settings)
             if parsed is None or not authorized_xmpp_message(parsed, self.settings):
                 return None
-            if not parsed.message_id:
+            if not parsed.message_id or not self._gateway_allows_side_effect(
+                parsed.user_id, parsed.chat_type, parsed.chat_id, _optional_thread_id(parsed.thread_id),
+            ):
                 return None
             if parsed.chat_type == "group":
                 return XmppReactionTarget(
@@ -1962,7 +2030,9 @@ class XMPPAdapter(BasePlatformAdapter):
         if chat_type == "group":
             return None
         user_id = str(getattr(source, "user_id", "") or chat_id)
-        if not _authorized_direct_message(self.settings, user_id):
+        if not _authorized_direct_message(self.settings, user_id) or not self._gateway_allows_side_effect(
+            user_id, chat_type, chat_id, _optional_thread_id(getattr(source, "thread_id", None)),
+        ):
             return None
         target = self._last_full_jid_by_chat.get(_bare_jid(chat_id), _normalize_target(chat_id))
         return XmppReactionTarget(
@@ -2051,7 +2121,10 @@ class XMPPAdapter(BasePlatformAdapter):
         if parsed.chat_type == "dm" and parsed.raw_from:
             self._last_full_jid_by_chat[parsed.chat_id] = parsed.raw_from
 
-        await self._send_receipt_actions(receipt_actions_for(parsed, self.settings))
+        if self._gateway_allows_side_effect(
+            parsed.user_id, parsed.chat_type, parsed.chat_id, _optional_thread_id(parsed.thread_id),
+        ):
+            await self._send_receipt_actions(receipt_actions_for(parsed, self.settings))
         source = self.build_source(
             chat_id=parsed.chat_id,
             chat_name=parsed.chat_name,

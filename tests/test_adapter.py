@@ -1037,12 +1037,16 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
                 self.jid = jid
                 self.password = password
                 self.boundjid = types.SimpleNamespace(resource="")
+                self.requested_jid = types.SimpleNamespace(resource="")
                 self.plugin = {}
                 self.enable_starttls = False
                 self.enable_direct_tls = True
                 self.enable_plaintext = True
 
-            def register_plugin(self, plugin):
+            def register_handler(self, handler):
+                pass
+
+            def register_plugin(self, plugin, **kwargs):
                 self.plugin[plugin] = object()
 
             def add_event_handler(self, *args, **kwargs):
@@ -1196,10 +1200,14 @@ class ParseAndReceiptTests(unittest.IsolatedAsyncioTestCase):
                 self.jid = jid
                 self.password = password
                 self.boundjid = types.SimpleNamespace(resource="")
+                self.requested_jid = types.SimpleNamespace(resource="")
                 self.plugin = {}
                 self.handlers = {}
 
-            def register_plugin(self, plugin):
+            def register_handler(self, handler):
+                pass
+
+            def register_plugin(self, plugin, **kwargs):
                 self.plugin[plugin] = object()
 
             def add_event_handler(self, event_name, handler, *args, **kwargs):
@@ -2793,11 +2801,15 @@ class ScopedIdentityLockTests(unittest.IsolatedAsyncioTestCase):
         class FakeClientXMPP:
             def __init__(self, jid, password):
                 self.boundjid = types.SimpleNamespace(resource="")
+                self.requested_jid = types.SimpleNamespace(resource="")
                 self.plugin = {}
                 self.abort_calls = 0
                 built.append(self)
 
-            def register_plugin(self, plugin):
+            def register_handler(self, handler):
+                pass
+
+            def register_plugin(self, plugin, **kwargs):
                 self.plugin[plugin] = object()
 
             def add_event_handler(self, *_args, **_kwargs):
