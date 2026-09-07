@@ -137,7 +137,7 @@ optional_env:
     prompt: "Lifecycle status delivery mode"
     password: false
   - name: XMPP_EDITABLE_PROGRESS
-    description: "When lifecycle status delivery is edit: known (probe recipient support, default), force (always send XEP-0308), or disabled"
+    description: "When lifecycle status delivery is edit: known (probe recipient support, default) or disabled"
     prompt: "Editable lifecycle status policy"
     password: false
   - name: XMPP_ANONYMOUS_MUC_POLICY
