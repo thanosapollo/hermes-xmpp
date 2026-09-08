@@ -85,6 +85,45 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(platform_extra["tool_progress_bubble_limit"], 17)
         self.assertEqual(platform_extra["editable_progress_policy"], "disabled")
 
+    def test_yaml_allowed_users_survive_env_enablement_with_env_precedence(self):
+        for yaml_users in (["friend@example.org", "other@example.org"],
+                           "friend@example.org,other@example.org"):
+            for env_users in (None, "", "operator@example.org"):
+                with self.subTest(yaml_users=yaml_users, env_users=env_users):
+                    clear_xmpp_env()
+                    if env_users is not None:
+                        os.environ["XMPP_ALLOWED_USERS"] = env_users
+                    extra = adapter._apply_yaml_config({}, {"extra": {
+                        "jid": "bot@example.org",
+                        "server": "chat.example.org",
+                        "allowed_users": yaml_users,
+                    }})
+                    seed = adapter._env_enablement()
+                    if seed is None or extra is None:
+                        self.fail("expected YAML bridge and env enablement")
+                    seed.pop("home_channel")
+                    extra.update(seed)
+                    settings = adapter.XmppSettings.from_config(
+                        types.SimpleNamespace(extra=extra)
+                    )
+                    expected = ({"operator@example.org"} if env_users else
+                                {"friend@example.org", "other@example.org"})
+                    self.assertEqual(settings.allowed_users, expected)
+                    self.assertEqual(set(seed["allowed_users"]), expected)
+                    self.assertEqual(
+                        os.environ["XMPP_ALLOWED_USERS"],
+                        env_users or "friend@example.org,other@example.org",
+                    )
+                    for sender in expected:
+                        self.assertTrue(adapter._authorized_direct_message(settings, sender))
+                    self.assertFalse(adapter._authorized_direct_message(
+                        settings, "stranger@example.org"
+                    ))
+                    if env_users:
+                        self.assertFalse(adapter._authorized_direct_message(
+                            settings, "friend@example.org"
+                        ))
+
     def test_env_enablement_omits_allowed_rooms_when_unset_so_rooms_fallback_survives_merge(self):
         """Unset XMPP_ALLOWED_ROOMS must not seed empty list that blocks rooms fallback."""
         os.environ["XMPP_JID"] = "bot@example.org"
